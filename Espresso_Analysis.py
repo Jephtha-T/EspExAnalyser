@@ -5,7 +5,7 @@ import numpy as np
 
 # === CONFIGURATION ===
 base_dir = os.path.dirname(os.path.abspath(__file__))
-VIDEO_PATH = os.path.join(base_dir, "Video Data/test3.mp4")
+VIDEO_PATH = os.path.join(base_dir, "Video Data/test1.mp4")
 FRAME_DIR = os.path.join(base_dir, "Image Data/Frames")
 MODEL_PATH = "models/portafilter_yolov8.pt"
 FRAME_RATE = 1  # fps for analysis
@@ -37,6 +37,12 @@ def extract_frames(video_path, output_dir, target_fps=FRAME_RATE):
         ret, frame = cap.read()
         if not ret:
             break
+
+        # Check if rotation is needed (portrait frame with landscape shape)
+        h, w = frame.shape[:2]
+        if w > h:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)  # or ROTATE_90_COUNTERCLOCKWISE if needed
+
         if frame_idx % frame_interval == 0:
             out_path = os.path.join(output_dir, f"frame_{saved_count:04d}.jpg")
             cv2.imwrite(out_path, frame)

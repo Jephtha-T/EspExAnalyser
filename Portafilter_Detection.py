@@ -1,9 +1,29 @@
 import cv2
 import os
 import numpy as np
+from PIL import Image, ExifTags
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 FRAME_DIR = os.path.join(base_dir, "Image Data/Frames")
+
+def load_image_with_orientation(path):
+    image = Image.open(path)
+    try:
+        for orientation in ExifTags.TAGS.keys():
+            if ExifTags.TAGS[orientation] == "Orientation":
+                break
+        exif = image._getexif()
+        if exif is not None:
+            orientation_value = exif.get(orientation, None)
+            if orientation_value == 3:
+                image = image.rotate(180, expand=True)
+            elif orientation_value == 6:
+                image = image.rotate(270, expand=True)
+            elif orientation_value == 8:
+                image = image.rotate(90, expand=True)
+    except Exception as e:
+        print("EXIF orientation not found or failed:", e)
+    return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
 def safe_draw_ellipse(img, ellipse, color, thickness=1):
     if ellipse is None:
@@ -243,7 +263,7 @@ def detect_elliptical_portafilter_with_holes(image):
 
 
 img_path = os.path.join(FRAME_DIR, "frame_0000.jpg")
-frame = cv2.imread(img_path)
+frame = load_image_with_orientation(img_path)
 result = detect_elliptical_portafilter_with_holes(frame)
 cv2.imshow("Detected Portafilter", result)
 cv2.waitKey(0)
