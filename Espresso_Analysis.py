@@ -5,7 +5,7 @@ import numpy as np
 
 # === CONFIGURATION ===
 base_dir = os.path.dirname(os.path.abspath(__file__))
-VIDEO_PATH = os.path.join(base_dir, "Video Data/test1.mp4")
+VIDEO_PATH = os.path.join(base_dir, "Video Data/test5.mp4")
 FRAME_DIR = os.path.join(base_dir, "Image Data/Frames")
 MODEL_PATH = "models/portafilter_yolov8.pt"
 FRAME_RATE = 1  # fps for analysis
