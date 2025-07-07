@@ -12,33 +12,31 @@ FRAME_DIR = os.path.join(base_dir, "Image Data/PF1")
 
 def create_interactive_dashboard(images_dict, save_path=None):
     """
-    Create an interactive matplotlib dashboard showing all intermediary steps.
+    Create an interactive slideshow dashboard showing all intermediary steps.
     
     Args:
         images_dict: Dictionary with keys as step names and values as images
-        save_path: Optional path to save the dashboard image
+        save_path: Optional path to save the current slide (deprecated)
     """
-    # Calculate grid dimensions
-    n_images = len(images_dict)
-    n_cols = 4
-    n_rows = (n_images + n_cols - 1) // n_cols
+    # Convert dictionary to list for easier navigation
+    step_names = list(images_dict.keys())
+    images = list(images_dict.values())
+    current_index = 0
     
-    # Create figure and subplots
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 4*n_rows))
-    fig.suptitle('Portafilter Detection Pipeline - Interactive Dashboard', fontsize=16, fontweight='bold')
+    # Create figure for slideshow with more space for buttons
+    fig, ax = plt.subplots(figsize=(12, 9))
+    fig.suptitle('Portafilter Detection Pipeline - Slideshow', fontsize=16, fontweight='bold')
     
-    # Flatten axes for easier iteration
-    if n_rows == 1:
-        axes = [axes] if n_cols == 1 else axes
-    else:
-        axes = axes.flatten()
+    # Enable zoom and pan functionality
+    ax.set_navigate(True)
     
-    # Add images to subplots
-    for idx, (step_name, img) in enumerate(images_dict.items()):
-        if idx >= len(axes):
-            break
-            
-        ax = axes[idx]
+    def update_slide():
+        """Update the current slide"""
+        ax.clear()
+        
+        # Get current image and name
+        img = images[current_index]
+        step_name = step_names[current_index]
         
         # Convert image to RGB if needed
         if len(img.shape) == 3 and img.shape[2] == 3:
@@ -52,45 +50,65 @@ def create_interactive_dashboard(images_dict, save_path=None):
         
         # Display image
         ax.imshow(img_rgb)
-        ax.set_title(step_name, fontsize=10, fontweight='bold')
+        ax.set_title(f'{step_name} ({current_index + 1}/{len(images)})', fontsize=14, fontweight='bold')
         ax.axis('off')
         
-        # Enable zoom and pan
-        ax.set_navigate(True)
-    
-    # Hide empty subplots
-    for idx in range(len(images_dict), len(axes)):
-        axes[idx].axis('off')
-    
-    # Add save button
-    if save_path:
-        def save_dashboard(event):
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Dashboard saved to: {save_path}")
+        # Update navigation info
+        nav_text.set_text(f'Step {current_index + 1} of {len(images)}: {step_name}')
         
-        # Create button axes
-        button_ax = plt.axes((0.8, 0.02, 0.1, 0.04))
-        save_button = Button(button_ax, 'Save Dashboard')
-        save_button.on_clicked(save_dashboard)
+        plt.draw()
     
-    # Add individual image save functionality
-    def on_image_click(event):
-        if event.inaxes is not None:
-            ax = event.inaxes
-            title = ax.get_title()
-            if title and title != "":
-                # Save individual image
-                img_data = ax.get_images()[0].get_array()
-                individual_save_path = f"step_{title.replace(' ', '_').lower()}.png"
-                plt.imsave(individual_save_path, img_data)
-                print(f"Saved {title} to: {individual_save_path}")
+    def next_slide(event):
+        """Go to next slide"""
+        nonlocal current_index
+        current_index = (current_index + 1) % len(images)
+        update_slide()
     
-    # Connect click event
-    fig.canvas.mpl_connect('button_press_event', on_image_click)
+    def prev_slide(event):
+        """Go to previous slide"""
+        nonlocal current_index
+        current_index = (current_index - 1) % len(images)
+        update_slide()
     
-    # Add instructions
-    fig.text(0.02, 0.02, 'Click on any image to save it individually\nUse mouse wheel to zoom, drag to pan', 
-             fontsize=8, style='italic', bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+    # Create smaller navigation buttons positioned to avoid image overlap
+    button_height = 0.04
+    button_width = 0.08
+    
+    # Previous button - bottom left
+    prev_ax = plt.axes((0.05, 0.02, button_width, button_height))
+    prev_button = Button(prev_ax, '← Previous', color='lightgray', hovercolor='lightblue')
+    prev_button.on_clicked(prev_slide)
+    
+    # Next button - bottom right
+    next_ax = plt.axes((0.87, 0.02, button_width, button_height))
+    next_button = Button(next_ax, 'Next →', color='lightgray', hovercolor='lightblue')
+    next_button.on_clicked(next_slide)
+    
+    # Navigation info text - top left
+    nav_text = fig.text(0.02, 0.95, '', fontsize=10, 
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+    
+    # Instructions text - top right
+    fig.text(0.98, 0.95, 'Navigation: ← → arrow keys\n'
+             'Zoom: Mouse wheel\n'
+             'Pan: Click and drag', 
+             fontsize=8, style='italic', ha='right', va='top',
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue"))
+    
+    # Keyboard navigation
+    def on_key(event):
+        if event.key == 'left':
+            prev_slide(None)
+        elif event.key == 'right':
+            next_slide(None)
+    
+    fig.canvas.mpl_connect('key_press_event', on_key)
+    
+    # Initialize first slide
+    update_slide()
+    
+    # Enable navigation toolbar
+    plt.rcParams['toolbar'] = 'toolbar2'
     
     plt.tight_layout()
     plt.show()
@@ -756,7 +774,6 @@ def detect_elliptical_portafilter_with_holes(image, save_dashboard=False, dashbo
         debug_images["Sharpened"] = image.copy()
     
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    debug_images["Grayscale"] = gray
 
     # === FAST Corner Detection for Portafilter Holes ===
     # Use original/sharpened image for optimal feature detection (not blurred)
@@ -779,7 +796,6 @@ def detect_elliptical_portafilter_with_holes(image, save_dashboard=False, dashbo
     # Use blurred image ONLY for ellipse detection
     el_edges = cv2.Canny(el_gray, 100, 200, apertureSize=3)
     debug_images["Canny Edges"] = edges
-    debug_images["Ellipse Edges"] = el_edges
 
     # === 1. Hough Line Detection ===
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=20, maxLineGap=10)
@@ -808,8 +824,6 @@ def detect_elliptical_portafilter_with_holes(image, save_dashboard=False, dashbo
                     sy2 = int(y1 + t2 * dy)
                     cv2.line(output, (sx1, sy1), (sx2, sy2), (0, 255, 0), 1)
 
-    debug_images["Hough Lines"] = output
-
     # === 2. FAST Circle Detection ===
     # Use original/sharpened image for optimal circle detection (not blurred)
     print("Detecting circles using FAST...")
@@ -828,8 +842,6 @@ def detect_elliptical_portafilter_with_holes(image, save_dashboard=False, dashbo
     for kp in filtered_keypoints:
         x, y = int(kp.pt[0]), int(kp.pt[1])
         cv2.circle(output, (x, y), 3, (255, 0, 0), -1)  # Draw small circles
-    
-    debug_images["FAST Circles"] = output
 
     # === 3. Ellipse Detection via Contours ===
     contours, _ = cv2.findContours(el_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -856,7 +868,7 @@ def detect_elliptical_portafilter_with_holes(image, save_dashboard=False, dashbo
             areas.append(area)
             safe_draw_ellipse(output, ellipse, (0, 0, 255), 1)
 
-    debug_images["All Ellipses"] = output
+    debug_images["Detected Features"] = output
 
     # Step 4: Score and highlight best ellipse with SURF features
     print("\n=== Evaluating ellipses with SURF features ===")
@@ -911,21 +923,44 @@ def detect_elliptical_portafilter_with_holes(image, save_dashboard=False, dashbo
     cropped_img = crop_image_by_ellipse(original_image, best_ellipse)
     debug_images["Cropped Result"] = cropped_img
 
+    # Reorder debug images for better slideshow flow
+    ordered_debug_images = {}
+    
+    # Add images in desired order
+    if "Original" in debug_images:
+        ordered_debug_images["Original"] = debug_images["Original"]
+    if "Sharpened" in debug_images:
+        ordered_debug_images["Sharpened"] = debug_images["Sharpened"]
+    if "Blurred" in debug_images:
+        ordered_debug_images["Blurred"] = debug_images["Blurred"]
+    if "Canny Edges" in debug_images:
+        ordered_debug_images["Canny Edges"] = debug_images["Canny Edges"]
+    if "FAST Keypoints" in debug_images:
+        ordered_debug_images["FAST Keypoints"] = debug_images["FAST Keypoints"]
+    if "Detected Features" in debug_images:
+        ordered_debug_images["Detected Features"] = debug_images["Detected Features"]
+    if "Ellipse Comparison" in debug_images:
+        ordered_debug_images["Ellipse Comparison"] = debug_images["Ellipse Comparison"]
+    if "Final Result" in debug_images:
+        ordered_debug_images["Final Result"] = debug_images["Final Result"]
+    if "Cropped Result" in debug_images:
+        ordered_debug_images["Cropped Result"] = debug_images["Cropped Result"]
+    
     # Create and show the dashboard
     save_path = dashboard_path if save_dashboard else None
     
     if use_interactive:
         # Use interactive matplotlib dashboard
-        create_interactive_dashboard(debug_images, save_path=save_path)
+        create_interactive_dashboard(ordered_debug_images, save_path=save_path)
     else:
         # Use simple OpenCV dashboard
-        create_debug_dashboard(debug_images, save_path=save_path)
+        create_debug_dashboard(ordered_debug_images, save_path=save_path)
 
     return output2
 
 # Test the implementation
 if __name__ == "__main__":
-    img_path = os.path.join(FRAME_DIR, "frame_4.jpg")
+    img_path = os.path.join(FRAME_DIR, "frame_1.jpg")
     if os.path.exists(img_path):
         frame = load_image_with_orientation(img_path)
         
