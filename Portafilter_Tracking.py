@@ -3,49 +3,49 @@ import numpy as np
 import os
 from Portafilter_Detection import detect_elliptical_portafilter_with_holes, load_image_with_orientation
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-INPUT_DIR = os.path.join(BASE_DIR, "Image Data", "Frames")       # Original ROI frames
-CROP_DIR = os.path.join(BASE_DIR, "Image Data", "Cropped")      # cropped frames
-OUTPUT_DIR = os.path.join(BASE_DIR, "Image Data", "Stabilised")  # stabilised output
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-ROI_SCALE = 1.5  # how far below the portafilter ellipse to crop (1–2 diameters)
+base_dir = os.path.dirname(os.path.abspath(__file__))
+input_dir = os.path.join(base_dir, "Image Data", "Frames")
+crop_dir = os.path.join(base_dir, "Image Data", "Cropped")
+os.makedirs(crop_dir, exist_ok=True)
 
 
-
-def get_portafilter_reference():
-    first_frame_path = os.path.join(INPUT_DIR, "frame_0001.jpg")
-    second_frame_path = os.path.join(INPUT_DIR, "frame_0020.jpg")
+def get_portafilter_reference(frames_dir):
+    # Detect a reference ellipse from early frames.
+    first_frame_path = os.path.join(frames_dir, "frame_0001.jpg")
+    second_frame_path = os.path.join(frames_dir, "frame_0020.jpg")
 
     if not os.path.exists(first_frame_path):
-        raise FileNotFoundError("frame_0001.jpg not found")
+        # Try alternate naming
+        frame_files = sorted([f for f in os.listdir(frames_dir) if f.lower().endswith((".jpg", ".png"))])
+        if len(frame_files) == 0:
+            raise FileNotFoundError("No frames found in directory")
+        first_frame_path = os.path.join(frames_dir, frame_files[0])
+        second_frame_path = os.path.join(frames_dir, frame_files[min(20, len(frame_files)-1)])
 
     frame1 = load_image_with_orientation(first_frame_path)
-    frame20 = (
-        load_image_with_orientation(second_frame_path)
-        if os.path.exists(second_frame_path)
-        else None
-    )
+    frame20 = load_image_with_orientation(second_frame_path)
 
-    print("[INFO] Detecting portafilter ellipse...")
-    _, ellipse = detect_elliptical_portafilter_with_holes(
+    print("Detecting portafilter ellipse...")
+    _, ellipse, hole_mode_size, fast_params = detect_elliptical_portafilter_with_holes(
         frame1,
         save_dashboard=False,
         use_interactive=False,
         second_frame=frame20,
-        mask_threshold=15
+        mask_threshold=15,
     )
 
     if ellipse is None:
         raise RuntimeError("Portafilter detection failed")
 
-    return ellipse
+    print("Portafilter ellipse detected")
+    print(f"Hole mode size: {hole_mode_size}")
+
+    return ellipse, hole_mode_size
 
 
-def crop_roi(frame, ellipse, padding=10):
-    (cx, cy), (major, minor), _ = ellipse
-    h, w = frame.shape[:2]
-
+def get_crop_bounds(frame_shape, ellipse, padding=12):
+    # Build crop bounds around the detected ellipse.
+    h, w = frame_shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.ellipse(mask, ellipse, 255, -1)
 
@@ -53,116 +53,88 @@ def crop_roi(frame, ellipse, padding=10):
     if len(xs) == 0:
         raise RuntimeError("Empty ellipse mask")
 
-    x1 = max(xs.min() - padding, 0)
-    x2 = min(xs.max() + padding, w)
-    y1 = max(ys.min() - padding, 0)
+    x1 = max(int(xs.min()) - padding, 0)
+    x2 = min(int(xs.max()) + padding + 1, w)
+    y1 = max(int(ys.min()) - padding, 0)
     y2 = h  # keep stream below basket
 
+    return x1, y1, x2, y2
+
+
+def crop_roi(frame, crop_bounds):
+    # Crop frame using precomputed bounds.
+    x1, y1, x2, y2 = crop_bounds
     return frame[y1:y2, x1:x2]
 
-def load_and_crop_frames(ellipse):
-    frame_files = sorted(
-        f for f in os.listdir(INPUT_DIR)
+
+def crop_frames(frames_dir, output_dir, ellipse):
+    # Load frames and save a fixed ROI crop for each frame.
+    frame_files = sorted([
+        f for f in os.listdir(frames_dir)
         if f.lower().endswith((".jpg", ".png"))
-    )
+    ])
+
+    if len(frame_files) < 2:
+        raise RuntimeError("Not enough frames for processing")
+
+    print("Loading and cropping frames with fixed ROI bounds...")
+    first_frame = load_image_with_orientation(os.path.join(frames_dir, frame_files[0]))
+    crop_bounds = get_crop_bounds(first_frame.shape, ellipse, padding=12)
+
+    x1, y1, x2, y2 = crop_bounds
+    target_h = y2 - y1
+    target_w = x2 - x1
 
     cropped_frames = []
-
-    for i, fname in enumerate(frame_files):
-        frame = load_image_with_orientation(os.path.join(INPUT_DIR, fname))
-        roi = crop_roi(frame, ellipse)
-        crop_path = os.path.join(CROP_DIR, f"cropped_{i:04d}.jpg")
-        cv2.imwrite(crop_path, roi)
+    for fname in frame_files:
+        frame = load_image_with_orientation(os.path.join(frames_dir, fname))
+        roi = crop_roi(frame, crop_bounds)
+        if roi.shape[:2] != (target_h, target_w):
+            roi = cv2.resize(roi, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
         cropped_frames.append((fname, roi))
 
-    if len(cropped_frames) < 2:
-        raise RuntimeError("Not enough frames for cropping")
+    print(f"Loaded {len(cropped_frames)} cropped frames")
 
+    # Save cropped frames
+    print("Saving cropped frames...")
+    os.makedirs(output_dir, exist_ok=True)
+    for i, (fname, frame) in enumerate(cropped_frames):
+        output_path = os.path.join(output_dir, f"frame_{i:04d}.jpg")
+        cv2.imwrite(output_path, frame)
+
+    print(f"Saved {len(cropped_frames)} cropped frames to {output_dir}")
     return cropped_frames
 
-def stabilise_frames(cropped_frames):
-    ref_name, ref_frame = cropped_frames[0]
-    ref_gray = cv2.cvtColor(ref_frame, cv2.COLOR_BGR2GRAY)
-    h, w = ref_gray.shape
 
-    # FAST features (good for rim + holes)
-    fast = cv2.FastFeatureDetector_create(threshold=20, nonmaxSuppression=True)
-    kp = fast.detect(ref_gray, None)
+def process_portafilter_tracking(frames_dir=None, output_dir=None):
+    # Detect the basket and crop all frames to a stable ROI.
+    if frames_dir is None:
+        frames_dir = input_dir
+    if output_dir is None:
+        output_dir = crop_dir
 
-    if len(kp) < 20:
-        raise RuntimeError("Insufficient FAST keypoints for stabilisation")
+    print(f"Input frames directory: {frames_dir}")
+    print(f"Output directory: {output_dir}")
 
-    pts_prev = np.array([k.pt for k in kp], dtype=np.float32).reshape(-1, 1, 2)
-    prev_gray = ref_gray
+    # Step 1: Detect portafilter ellipse
+    ellipse, hole_mode_size = get_portafilter_reference(frames_dir)
 
-    stabilised = [(ref_name, ref_frame)]
+    # Step 2: Crop frames
+    cropped_frames = crop_frames(frames_dir, output_dir, ellipse)
 
-    for fname, frame in cropped_frames[1:]:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return {
+        "ellipse": ellipse,
+        "hole_mode_size": hole_mode_size,
+        "output_dir": output_dir,
+        "frame_count": len(cropped_frames)
+    }
 
-        pts_curr, status, _ = cv2.calcOpticalFlowPyrLK(
-            prev_gray,
-            gray,
-            pts_prev,
-            None,
-            winSize=(21, 21),
-            maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-        )
-
-        if pts_curr is None:
-            stabilised.append((fname, frame))
-            continue
-
-        good_prev = pts_prev[status.flatten() == 1]
-        good_curr = pts_curr[status.flatten() == 1]
-
-        if len(good_prev) < 6:
-            stabilised.append((fname, frame))
-            continue
-
-        # Estimate translation + small rotation
-        M, _ = cv2.estimateAffinePartial2D(
-            good_curr,
-            good_prev,
-            method=cv2.RANSAC,
-            ransacReprojThreshold=3
-        )
-
-        if M is None:
-            stabilised.append((fname, frame))
-            continue
-
-        aligned = cv2.warpAffine(
-            frame,
-            M,
-            (w, h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REPLICATE
-        )
-
-        stabilised.append((fname, aligned))
-        prev_gray = gray
-        pts_prev = good_curr.reshape(-1, 1, 2)
-
-    return stabilised
-
-
-# ============================
-# MAIN
-# ============================
 
 if __name__ == "__main__":
+    result = process_portafilter_tracking()
+    print("\n===== PORTAFILTER TRACKING COMPLETE =====")
+    print(f"Ellipse: {result['ellipse']}")
+    print(f"Hole mode size: {result['hole_mode_size']}")
+    print(f"Frames processed: {result['frame_count']}")
 
-    print("[INFO] Starting portafilter stabilisation pipeline")
-
-    ellipse = get_portafilter_reference()
-    cropped_frames = load_and_crop_frames(ellipse)
-    stabilised_frames = stabilise_frames(cropped_frames)
-
-    print("[INFO] Saving stabilised frames...")
-    for i, (fname, frame) in enumerate(stabilised_frames):
-        cv2.imwrite(os.path.join(OUTPUT_DIR, f"stabilised_{i:04d}.jpg"), frame)
-
-    print(f"[DONE] Stabilised frames saved to {OUTPUT_DIR}")
 

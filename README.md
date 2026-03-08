@@ -26,25 +26,48 @@ Based on the interim report, the current codebase includes:
 - Early feature extraction work (including colour/brightness trend analysis)
 - Initial analysis plots and intermediate outputs
 
-### Interim Progress Snapshot
-- Dataset collected: 42 videos total
-- Controlled recordings: 30
-- Real-world cafe recordings: 12
-- Basket detection success: 81% overall
-- Controlled success: 83%
-- Real-world success: 75%
-
 ## Repository Structure
-- `Frame_Extraction.py`: Extracts frames from raw video (target sampling, orientation correction).
-- `Portafilter_Detection.py`: Multi-stage ROI detection for basket localisation.
-- `Portafilter_Tracking.py`: Basket tracking/cropping pipeline (intermediate stage support).
-- `Feature_Extraction.py`: Ongoing feature and anomaly-related extraction logic.
-- `Espresso_Analysis.py`: End-to-end style analysis script for extraction signals and outputs.
-- `Video Data/`: Input extraction videos.
-- `Image Data/Frames`: Extracted frames.
-- `Image Data/Cropped`: ROI-cropped basket frames.
-- `Image Data/Stabilised`: Stabilised/processed frame sequences.
-- `Image Data/Analysis`: Analysis plots and generated outputs.
+```
+EspExAnalyser/
+├── Frame_Extraction.py              # Extract frames from video
+├── Portafilter_Detection.py         # Detect portafilter ROI
+├── Portafilter_Tracking.py          # Track and stabilise portafilter
+├── Feature_Extraction.py            # Extract blonding and channeling features
+├── Data_Export.py                   # Export analysis data to CSV for AI training
+├── Espresso_Analysis.py             # Main pipeline orchestrator
+├── README.md                        # Main ReadMe
+│
+├── Video Data/                      # Input videos
+│   ├── test1.mp4
+│   ├── test2.mp4
+│   ├── labels.csv                   # Video metadata and quality labels (input)
+│   └── ...
+│
+├── Image Data/
+│   ├── Frames/                      # Extracted frames from video
+│   └── Cropped/                     # Cropped and stabilised portafilter ROI
+│
+└── Analysis/                        # Output analysis results
+    ├── Blond.png            # Blonding curve plot
+    ├── Channeling.png       # Channeling detection plot
+    ├── results.json         # Analysis metrics (frame #, rate, etc.)
+    └── training_data.csv            # Exported features for AI model (output)
+```
+
+### Pipeline Stages
+
+```
+Video Input
+    ↓
+[1] Frame Extraction
+    └─→ Frames/ (extracted frames)
+    ↓
+[2] Portafilter Tracking (Detection + Cropping + Stabilisation)
+    └─→ Cropped/ (stabilised cropped frames)
+    ↓
+[3] Feature Extraction (Blonding & Channeling)
+    └─→ Analysis/ (results, plots, JSON)
+```
 
 ## Environment
 Recommended environment:
@@ -59,60 +82,38 @@ Install example:
 ```bash
 pip install opencv-python numpy matplotlib pillow scikit-learn
 ```
+## Run Complete Pipeline
 
-## How To Run (Current Pipeline)
-Run from the `EspExAnalyser` directory.
-
-1. Extract frames from source video:
 ```bash
-python Frame_Extraction.py
+python Espresso_Analysis.py --mode single --video-name test1.mp4
 ```
 
-2. Detect basket ROI / run detection pipeline:
+Run every video in `Video Data/`:
 ```bash
-python Portafilter_Detection.py
+python Espresso_Analysis.py --mode all
 ```
 
-3. Run analysis/feature pipeline:
+This will:
+1. Extract frames to `Image Data/Frames/`
+2. Detect, crop, and stabilise to `Image Data/Cropped/`
+3. Extract features and save results to `Image Data/Analysis/`
+
+## Export Data for AI Training
+
+After running the analysis pipeline on your videos, you can export the extracted features to CSV format for machine learning model training:
+
+Set `EXPORT_MODE = True` in `Espresso_Analysis.py` (line 24) and run:
 ```bash
 python Espresso_Analysis.py
 ```
 
+This generates `Analysis/training_data.csv` with:
+- **Raw features**: shot_time, blonding_rate, channeling_avg/max/min
+- **Normalized features**: All numeric features scaled to [0, 1] using min-max normalization
+- **Labels**: Extraction quality from `Video Data/labels.csv` (e.g., "Ideal", "Under-extracted", "Over-extracted")
 Notes:
-- Some scripts currently use fixed local paths and constants at the top of each file.
+- Scripts currently use fixed local paths and constants at the top of each file.
 - Parameters (thresholds, ROI settings, frame rate) are intentionally exposed in code for tuning during experimentation.
-
-## Methodology Summary
-The planned full pipeline follows four stages:
-1. Video frame extraction
-2. Portafilter basket detection (ROI)
-3. Feature extraction and anomaly detection
-4. Quality classification and recommendations
-
-Planned extracted signals include:
-- Stream/flow consistency and width dynamics
-- Colour progression and blonding behaviour
-- Spatial unevenness indicative of channelling
-- Spraying/spurting events outside expected stream region
-
-## Current Limitations
-From interim findings:
-- ROI detection is sensitive to extreme lighting and blur.
-- Feature extraction is not yet complete across all target anomalies.
-- Dataset size is still limited for robust model training.
-- Ground-truth labels are primarily sensory/taste-based (limited instrumented TDS data).
-
-## Planned Next Steps
-- Expand dataset toward 100+ labelled videos.
-- Improve robustness of ROI detection under difficult lighting.
-- Complete anomaly detection and quality classification models.
-- Implement and evaluate taste profile estimation.
-- Build user-facing interface with recommendation/chatbot support.
-
-## Academic Sources
-This README is based on project materials in:
-- `../Academic/Project Proposal.docx`
-- `../Academic/Interim Report.docx`
 
 ## Author
 Jephtha Ashter Tandri (20600677)

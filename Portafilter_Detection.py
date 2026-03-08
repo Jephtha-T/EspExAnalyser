@@ -24,7 +24,7 @@ def create_interactive_dashboard(images_dict, save_path=None):
     ax.set_navigate(True)
     
     def update_slide():
-        """Update the current slide"""
+        # Update the current slide.
         ax.clear()
         
         # Get current image and name
@@ -52,13 +52,13 @@ def create_interactive_dashboard(images_dict, save_path=None):
         plt.draw()
     
     def next_slide(event):
-        """Go to next slide"""
+        # Go to the next slide.
         nonlocal current_index
         current_index = (current_index + 1) % len(images)
         update_slide()
     
     def prev_slide(event):
-        """Go to previous slide"""
+        # Go to the previous slide.
         nonlocal current_index
         current_index = (current_index - 1) % len(images)
         update_slide()
@@ -189,110 +189,6 @@ def load_image_with_orientation(path):
         print("EXIF orientation not found or failed:", e)
     return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
-def detect_surf_corners(image, hessian_threshold=400, min_circularity=0.7):
-    # Try to use SURF if available (patented, may not be available in all OpenCV builds)
-    try:
-        xfeatures2d = getattr(cv2, 'xfeatures2d', None)
-        if xfeatures2d is not None:
-            surf_create = getattr(xfeatures2d, 'SURF_create', None)
-            if surf_create is not None:
-                surf = surf_create(hessian_threshold)
-                keypoints = surf.detect(image, None)
-                print("Using SURF detector")
-            else:
-                raise AttributeError('SURF_create not available')
-        else:
-            raise AttributeError('xfeatures2d not available')
-    except Exception as e:
-        print(f"SURF not available ({e}), using FAST corner detector as fallback")
-        # Use getattr to avoid linter errors
-        fast_create = getattr(cv2, 'FastFeatureDetector_create', None)
-        if fast_create is not None:
-            fast = fast_create(threshold=15)  # Lower threshold for more sensitivity
-        else:
-            fast_class = getattr(cv2, 'FastFeatureDetector', None)
-            if fast_class is not None:
-                fast = fast_class.create(threshold=15)  # Lower threshold for more sensitivity
-            else:
-                raise RuntimeError('No FAST detector available in this OpenCV build')
-        keypoints = fast.detect(image, None)
-        print("Using FAST detector")
-    
-    # Filter keypoints for circularity
-    if keypoints:
-        filtered_keypoints = []
-        height, width = image.shape[:2]
-        
-        for kp in keypoints:
-            x, y = int(kp.pt[0]), int(kp.pt[1])
-            
-            # Handle different keypoint types (SURF vs FAST)
-            if hasattr(kp, 'size'):
-                size = int(kp.size)
-            else:
-                # FAST keypoints don't have size, use a reasonable default
-                size = 20
-            
-            # Check if keypoint is within image bounds
-            if x < size//2 or y < size//2 or x >= width - size//2 or y >= height - size//2:
-                continue
-            
-            # Extract region around keypoint
-            x1, y1 = max(0, int(x - size//2)), max(0, int(y - size//2))
-            x2, y2 = min(width, int(x + size//2)), min(height, int(y + size//2))
-            region = image[y1:y2, x1:x2]
-            
-            if region.size == 0:
-                continue
-            
-            # Calculate circularity using contour analysis
-            try:
-                # Create binary mask from region
-                _, binary = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                if contours:
-                    # Find the largest contour
-                    largest_contour = max(contours, key=cv2.contourArea)
-                    area = cv2.contourArea(largest_contour)
-                    
-                    if area > 0:
-                        # Calculate circularity
-                        perimeter = cv2.arcLength(largest_contour, True)
-                        if perimeter > 0:
-                            circularity = 4 * np.pi * area / (perimeter * perimeter)
-                            
-                            # Only keep keypoints with good circularity
-                            if circularity >= min_circularity:
-                                filtered_keypoints.append(kp)
-            except Exception as e:
-                # If circularity calculation fails, keep the keypoint
-                print(f"Circularity calculation failed for keypoint at ({x}, {y}): {e}")
-                filtered_keypoints.append(kp)
-        
-        #print(f"Filtered {len(keypoints)} keypoints to {len(filtered_keypoints)} circular features")
-        return filtered_keypoints
-    
-    return keypoints
-
-def filter_surf_keypoints_by_ellipse(keypoints, ellipse, image_shape):
-    if ellipse is None or keypoints is None:
-        return []
-    
-    (cx, cy), (major, minor), angle = ellipse
-    height, width = image_shape[:2]
-    
-    # Create mask for the ellipse
-    mask = np.zeros((height, width), dtype=np.uint8)
-    cv2.ellipse(mask, ellipse, (255, 255, 255), -1)
-    
-    filtered_keypoints = []
-    for kp in keypoints:
-        x, y = int(kp.pt[0]), int(kp.pt[1])
-        if 0 <= x < width and 0 <= y < height and mask[y, x] == 255:
-            filtered_keypoints.append(kp)
-    
-    return filtered_keypoints
 
 def safe_draw_ellipse(img, ellipse, color, thickness=1):
     if ellipse is None:
@@ -303,9 +199,9 @@ def safe_draw_ellipse(img, ellipse, color, thickness=1):
         return
     cv2.ellipse(img, ellipse, color, thickness)
 
-def ellipse_feature_score(image, lines, circles_list, ellipses, areas, surf_keypoints=None, fast_keypoints=None,
+def ellipse_feature_score(image, lines, circles_list, ellipses, areas, fast_keypoints=None,
                         MIN_FEATURES=5, MIN_AREA=500, MAX_AREA=50000,
-                        CENTER_BIAS_WEIGHT=0.02, SURF_WEIGHT=5.0, EMPTY_PENALTY_WEIGHT=50.0):
+                        EMPTY_PENALTY_WEIGHT=50.0):
     height, width = image.shape[:2]
     image_center = np.array([width // 2, height // 2])
     best_ellipse = None
@@ -314,14 +210,11 @@ def ellipse_feature_score(image, lines, circles_list, ellipses, areas, surf_keyp
     print(len(ellipses), "ellipses found")
 
     for el in ellipses:
-        #print(f"Evaluating ellipse: {el}")
         # Basic ellipse info
         (cx, cy), (x_len, y_len), angle = el
         if not (np.isfinite(x_len) and np.isfinite(y_len)):
-            #print(f"Skipping invalid ellipse: {el} infinite dimensions")
             continue
         if x_len <= 0 or y_len <= 0:
-            #print(f"Skipping invalid ellipse: {el} non-positive dimensions")
             continue
 
         # Create mask
@@ -332,57 +225,24 @@ def ellipse_feature_score(image, lines, circles_list, ellipses, areas, surf_keyp
         area = areas[n] if n < len(areas) else area  # Use precomputed area
         n += 1
         if area < MIN_AREA:
-            #print(f"Skipping ellipse: {el} due to small area ({area})")
             continue
 
-        # Count weighted features
-        feature_score = 0
-        surf_score = 0
-
-        # Count Hough lines within ellipse
-        if lines is not None:
-            for line in lines:
-                for x, y in [(line[0][0], line[0][1]), (line[0][2], line[0][3])]:
-                    if y < height and x < width and mask[y, x]:
-                        feature_score += 1
-
-        # Count FAST circles within ellipse
-        if fast_keypoints is not None:
-            for kp in fast_keypoints:
-                x, y = int(kp.pt[0]), int(kp.pt[1])
-                if 0 <= x < width and 0 <= y < height and mask[y, x]:
-                    feature_score += 2  # FAST circles get higher weight as they're more distinctive
-
-        # Calculate overall feature density score (all features per ellipse area)
-        density_score = calculate_feature_density_score(el, image.shape, surf_keypoints, lines, fast_keypoints)
+        # Calculate overall feature density score (FAST keypoints only)
+        density_score = calculate_feature_density_score(el, image.shape, fast_keypoints)
         
-        # Add center-weighted score for SURF keypoints if available
-        center_weighted_score = 0
-        if surf_keypoints is not None:
-            filtered_keypoints = filter_surf_keypoints_by_ellipse(surf_keypoints, el, image.shape)
-            center_weighted_score = calculate_center_weighted_score(filtered_keypoints, el, image.shape, center_weight=2.0)
-            
-            #print(f"Ellipse {el}: Found {len(filtered_keypoints)} SURF keypoints")
-            #print(f"  - Center-weighted score: {center_weighted_score:.2f}")
-        
-        # Combine scores: density is the primary factor
-        feature_score = density_score * 10000 + center_weighted_score * SURF_WEIGHT  # Scale density up for better comparison
-        
-        #print(f"  - Feature density score: {density_score:.6f}")
-        #print(f"  - Final feature score: {feature_score:.2f}")
+        # Use density score as the primary scoring metric
+        feature_score = density_score
 
-        # Require minimum SURF features for a valid portafilter
-        if surf_keypoints is not None and len(filtered_keypoints) < 3:  # At least 3 SURF points
-            #print(f"Skipping ellipse: {el} due to insufficient SURF features ({len(filtered_keypoints)})")
+        # Check for minimum features (FAST keypoints)
+        if fast_keypoints is None and lines is None:
             continue
 
         if feature_score < 5:
-            #print(f"Skipping ellipse: {el} due to insufficient total features ({feature_score})")
             continue
 
         # Penalize off-center ellipses
         dist_from_center = np.linalg.norm(np.array([cx, cy]) - image_center)
-        center_penalty = dist_from_center * CENTER_BIAS_WEIGHT
+        center_penalty = dist_from_center * 0.02
 
         # Final score: density-based with center bias
         score = feature_score - center_penalty
@@ -391,7 +251,7 @@ def ellipse_feature_score(image, lines, circles_list, ellipses, areas, surf_keyp
         if score > best_score:
             best_score = score
             best_ellipse = el
-    print(f"Best Ellipse: {best_ellipse}, Score: {best_score:.2f}")
+    print(f"Best Ellipse Score: {best_score:.2f}")
     return best_ellipse
 
 def crop_image_by_ellipse(image, ellipse, padding=10):
@@ -434,36 +294,9 @@ def crop_image_by_ellipse(image, ellipse, padding=10):
 
 
 
-def calculate_center_weighted_score(surf_keypoints, ellipse, image_shape, center_weight=2.0):
-    if not surf_keypoints or ellipse is None:
-        return 0
-    
-    (cx, cy), (major, minor), angle = ellipse
-    height, width = image_shape[:2]
-    image_center = np.array([width // 2, height // 2])
-    
-    total_score = 0
-    for kp in surf_keypoints:
-        x, y = kp.pt[0], kp.pt[1]
-        keypoint_pos = np.array([x, y])
-        
-        # Calculate distance from image center
-        dist_from_center = np.linalg.norm(keypoint_pos - image_center)
-        max_dist = np.linalg.norm(np.array([width, height]))
-        
-        # Normalize distance (0 = center, 1 = corner)
-        normalized_dist = dist_from_center / max_dist
-        
-        # Weight: closer to center = higher weight
-        weight = 1 + (center_weight - 1) * (1 - normalized_dist)
-        
-        total_score += weight
-    
-    return total_score
 
 
-
-def calculate_feature_density_score(ellipse, image_shape, surf_keypoints, lines, fast_keypoints):
+def calculate_feature_density_score(ellipse, image_shape, fast_keypoints):
     if ellipse is None:
         return 0
     
@@ -480,24 +313,8 @@ def calculate_feature_density_score(ellipse, image_shape, surf_keypoints, lines,
     if ellipse_area == 0:
         return 0
     
-    # Count features within ellipse
+    # Count FAST keypoints within ellipse (primary feature)
     feature_count = 0
-    
-    # Count SURF keypoints within ellipse
-    if surf_keypoints is not None:
-        filtered_surf = filter_surf_keypoints_by_ellipse(surf_keypoints, ellipse, image_shape)
-        feature_count += len(filtered_surf)
-    
-    # Count Hough lines within ellipse
-    if lines is not None:
-        line_count = 0
-        for line in lines:
-            for x, y in [(line[0][0], line[0][1]), (line[0][2], line[0][3])]:
-                if 0 <= y < height and 0 <= x < width and mask[y, x]:
-                    line_count += 1
-        feature_count += line_count
-    
-    # Count FAST circles within ellipse
     if fast_keypoints is not None:
         circle_count = 0
         for kp in fast_keypoints:
@@ -507,7 +324,7 @@ def calculate_feature_density_score(ellipse, image_shape, surf_keypoints, lines,
         feature_count += circle_count
     
     # Calculate density (features per pixel)
-    density = (feature_count**2) / (ellipse_area/10)
+    density = (feature_count**2) / (ellipse_area/5)
 
     #print(f"  Density Analysis:")
     #print(f"    - Ellipse area: {ellipse_area} pixels")
@@ -544,7 +361,7 @@ def detect_fast_circles(image, threshold=25, min_circularity=0.6):
         for kp in keypoints:
             x, y = int(kp.pt[0]), int(kp.pt[1])
             
-            # Handle different keypoint types (SURF vs FAST)
+            # Handle different keypoint types
             if hasattr(kp, 'size'):
                 size = int(kp.size)
             else:
@@ -671,7 +488,7 @@ def detect_elliptical_portafilter_with_holes(
     
     output = image.copy()
     output2 = image.copy()
-    debug_output = image.copy()  # For showing SURF evaluation process
+    debug_output = image.copy()  # For showing FAST evaluation process
 
     # Check if image is too sharp or too blurry
     lap_var = cv2.Laplacian(image, cv2.CV_64F).var()
@@ -745,14 +562,26 @@ def detect_elliptical_portafilter_with_holes(
         mask_ellipses = []
         mask_areas = []
 
-    #  FAST Corner Detection for Portafilter Holes
-    # Use original/sharpened image for optimal feature detection (not blurred)
-    print("Detecting FAST corners for portafilter holes...")
-    surf_keypoints = detect_surf_corners(gray, hessian_threshold=250, min_circularity=0.5)
-    print(f"Found {len(surf_keypoints)} FAST keypoints")
+    # Store FAST detection parameters for consistency in feature extraction
+    FAST_THRESHOLD = 15
+    FAST_MIN_CIRCULARITY = 0.4
+    FAST_SIZE_TOLERANCE = 5
+    
+    fast_keypoints, keypoint_sizes = detect_fast_circles(gray, threshold=FAST_THRESHOLD, min_circularity=FAST_MIN_CIRCULARITY)
+    
+    # Find mode size of circles
+    mode_size = find_mode_size(keypoint_sizes, tolerance=FAST_SIZE_TOLERANCE)
+    
+    # Filter keypoints to only use mode-sized circles
+    if mode_size is not None:
+        filtered_keypoints = filter_keypoints_by_size(fast_keypoints, keypoint_sizes, mode_size, tolerance=FAST_SIZE_TOLERANCE)
+    else:
+        filtered_keypoints = fast_keypoints
+    
+    print(f"Found {len(filtered_keypoints)} FAST keypoints")
 
     # Draw all FAST keypoints on debug output
-    cv2.drawKeypoints(debug_output, surf_keypoints, debug_output, color=(0, 255, 255),
+    cv2.drawKeypoints(debug_output, filtered_keypoints, debug_output, color=(0, 255, 255),
                     flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
     debug_images["FAST Keypoints"] = debug_output
 
@@ -794,17 +623,12 @@ def detect_elliptical_portafilter_with_holes(
                     sy2 = int(y1 + t2 * dy)
                     cv2.line(output, (sx1, sy1), (sx2, sy2), (0, 255, 0), 1)
 
-    # 2. FAST Circle Detection
-    # Use original/sharpened image for optimal circle detection (not blurred)
-    print("Detecting circles using FAST...")
-    fast_keypoints, keypoint_sizes = detect_fast_circles(gray, threshold=15, min_circularity=0.4)
-    
     # Find mode size of circles
-    mode_size = find_mode_size(keypoint_sizes, tolerance=5)
+    mode_size = find_mode_size(keypoint_sizes, tolerance=FAST_SIZE_TOLERANCE)
     
     # Filter keypoints to only use mode-sized circles
     if mode_size is not None:
-        filtered_keypoints = filter_keypoints_by_size(fast_keypoints, keypoint_sizes, mode_size, tolerance=5)
+        filtered_keypoints = filter_keypoints_by_size(fast_keypoints, keypoint_sizes, mode_size, tolerance=FAST_SIZE_TOLERANCE)
     else:
         filtered_keypoints = fast_keypoints
 
@@ -846,9 +670,9 @@ def detect_elliptical_portafilter_with_holes(
 
     debug_images["Detected Features"] = output
 
-    # Step 4: Score and highlight best ellipse with SURF features
-    print("Evaluating ellipses with SURF features")
-    best_ellipse = ellipse_feature_score(image, lines, None, ellipses, areas, surf_keypoints, fast_keypoints)
+    # Step 4: Score and highlight best ellipse with FAST features
+    print("Evaluating ellipses with FAST features")
+    best_ellipse = ellipse_feature_score(image, lines, None, ellipses, areas, filtered_keypoints)
     if best_ellipse is None and len(ellipses) > 0:
         print("WARNING: No high-score ellipse found - using largest fallback ellipse.")
         best_ellipse = max(
@@ -856,12 +680,20 @@ def detect_elliptical_portafilter_with_holes(
             key=lambda el: el[1][0] * el[1][1]  # selects by width × height
         )
     
-    # Create visualization showing SURF keypoints within the best ellipse
-    if best_ellipse is not None and surf_keypoints is not None:
-        filtered_keypoints = filter_surf_keypoints_by_ellipse(surf_keypoints, best_ellipse, image.shape)
+    # Create visualization showing FAST keypoints within the best ellipse
+    if best_ellipse is not None and filtered_keypoints is not None and len(filtered_keypoints) > 0:
+        # Filter keypoints to only those inside best ellipse
+        best_ellipse_keypoints = []
+        for kp in filtered_keypoints:
+            x, y = int(kp.pt[0]), int(kp.pt[1])
+            # Create temporary mask for best ellipse
+            temp_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+            cv2.ellipse(temp_mask, best_ellipse, 255, -1)
+            if 0 <= y < image.shape[0] and 0 <= x < image.shape[1] and temp_mask[y, x] == 255:
+                best_ellipse_keypoints.append(kp)
         
-        # Draw the best ellipse and its SURF keypoints
-        cv2.drawKeypoints(output2, filtered_keypoints, output2, color=(255, 0, 255), 
+        # Draw the best ellipse and its FAST keypoints
+        cv2.drawKeypoints(output2, best_ellipse_keypoints, output2, color=(255, 0, 255), 
                           flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
         # If best ellipse originates from mask set, draw it green; otherwise yellow
         def is_same_ellipse(e1, e2, tol=1e-1):
@@ -878,16 +710,16 @@ def detect_elliptical_portafilter_with_holes(
         if best_is_mask:
             safe_draw_ellipse(output2, best_ellipse, (0, 255, 0), 15)  # green for mask-derived
         else:
-            safe_draw_ellipse(output2, best_ellipse, (255, 0, 255), 15)  # red otherwise
+            safe_draw_ellipse(output2, best_ellipse, (255, 0, 255), 15)  # magenta otherwise
         
-        # Add text showing SURF count
+        # Add text showing FAST count
         (cx, cy), (major, minor), angle = best_ellipse
-        cv2.putText(output2, f"SURF: {len(filtered_keypoints)}", 
+        cv2.putText(output2, f"FAST: {len(best_ellipse_keypoints)}", 
                     (int(cx-50), int(cy-50)), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         
-        print(f"Best ellipse contains {len(filtered_keypoints)} SURF keypoints")
+        print(f"Best ellipse contains {len(best_ellipse_keypoints)} FAST keypoints")
         
-        # Show comparison: all ellipses with their SURF counts
+        # Show comparison: all ellipses with their FAST counts
         comparison_img = image.copy()
         for i, ellipse in enumerate(ellipses):
             # Determine color: green for mask-derived, yellow for best, red for others
@@ -902,9 +734,15 @@ def detect_elliptical_portafilter_with_holes(
             
             safe_draw_ellipse(comparison_img, ellipse, color, thickness)
             
-            # Count SURF points in this ellipse
-            if surf_keypoints is not None:
-                ellipse_keypoints = filter_surf_keypoints_by_ellipse(surf_keypoints, ellipse, image.shape)
+            # Count FAST points in this ellipse
+            if filtered_keypoints is not None:
+                ellipse_keypoints = []
+                for kp in filtered_keypoints:
+                    x, y = int(kp.pt[0]), int(kp.pt[1])
+                    temp_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+                    cv2.ellipse(temp_mask, ellipse, 255, -1)
+                    if 0 <= y < image.shape[0] and 0 <= x < image.shape[1] and temp_mask[y, x] == 255:
+                        ellipse_keypoints.append(kp)
                 (cx, cy), _, _ = ellipse
                 cv2.putText(comparison_img, f"{len(ellipse_keypoints)}", 
                             (int(cx-20), int(cy)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
@@ -951,8 +789,15 @@ def detect_elliptical_portafilter_with_holes(
         else:
             create_debug_dashboard(ordered_debug_images, save_path=dashboard_path)
 
-
-    return output2, best_ellipse
+    # Return FAST detection parameters for consistency in feature extraction
+    fast_params = {
+        'threshold': FAST_THRESHOLD,
+        'min_circularity': FAST_MIN_CIRCULARITY,
+        'size_tolerance': FAST_SIZE_TOLERANCE,
+        'mode_size': mode_size
+    }
+    
+    return output2, best_ellipse, mode_size, fast_params
 
 # Test Run
 if __name__ == "__main__":
@@ -986,7 +831,7 @@ if __name__ == "__main__":
 
         use_interactive = True
 
-        _, result = detect_elliptical_portafilter_with_holes(
+        _, result, mode_size, fast_params = detect_elliptical_portafilter_with_holes(
             frame,
             save_dashboard=True,
             dashboard_path="portafilter_detection_dashboard.png",
@@ -997,6 +842,8 @@ if __name__ == "__main__":
 
         if result is not None:
             print("Detection completed successfully!")
+            if mode_size is not None:
+                print(f"Detected hole mode size: {mode_size}")
             #cv2.waitKey(0)
             #cv2.destroyAllWindows()
         else:
