@@ -19,11 +19,15 @@ analysis_dir = os.path.join(base_dir, "Analysis")
 analysis_blond_dir = os.path.join(analysis_dir, "blond")
 analysis_channeling_dir = os.path.join(analysis_dir, "channeling")
 analysis_results_dir = os.path.join(analysis_dir, "results")
-video_name = "test1.mp4"
-run_mode = True
+video_name = "test6.mp4" # Only used in single-video mode, ignored in batch mode
+run_mode = True #True = single video mode, False = batch mode (all videos in directory)
 export_mode = False
 predict_mode = False
 model_path = os.path.join(analysis_dir, "extraction_model.joblib")
+# Optional manual portafilter ROI selection (single-video mode recommended)
+manual_portafilter_roi = True
+# Optional preset ellipse: ((cx, cy), (major, minor), angle)
+manual_portafilter_ellipse = None
 
 # Create necessary directories
 for directory in [
@@ -154,7 +158,9 @@ def run_espresso_analysis_pipeline(video_path,
         try:
             tracking_result = process_portafilter_tracking(
                 frames_dir=frames_dir,
-                output_dir=cropped_dir
+                output_dir=cropped_dir,
+                manual_roi=manual_portafilter_roi,
+                manual_ellipse=manual_portafilter_ellipse,
             )
             results["stages"]["portafilter_tracking"] = {
                 "status": "success",

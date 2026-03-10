@@ -9,7 +9,7 @@ crop_dir = os.path.join(base_dir, "Image Data", "Cropped")
 os.makedirs(crop_dir, exist_ok=True)
 
 
-def get_portafilter_reference(frames_dir):
+def get_portafilter_reference(frames_dir, manual_roi=False, manual_ellipse=None):
     # Detect a reference ellipse from early frames.
     first_frame_path = os.path.join(frames_dir, "frame_0001.jpg")
     second_frame_path = os.path.join(frames_dir, "frame_0020.jpg")
@@ -32,6 +32,8 @@ def get_portafilter_reference(frames_dir):
         use_interactive=False,
         second_frame=frame20,
         mask_threshold=15,
+        manual_roi=manual_roi,
+        manual_ellipse=manual_ellipse,
     )
 
     if ellipse is None:
@@ -106,7 +108,7 @@ def crop_frames(frames_dir, output_dir, ellipse):
     return cropped_frames
 
 
-def process_portafilter_tracking(frames_dir=None, output_dir=None):
+def process_portafilter_tracking(frames_dir=None, output_dir=None, manual_roi=False, manual_ellipse=None):
     # Detect the basket and crop all frames to a stable ROI.
     if frames_dir is None:
         frames_dir = input_dir
@@ -117,7 +119,11 @@ def process_portafilter_tracking(frames_dir=None, output_dir=None):
     print(f"Output directory: {output_dir}")
 
     # Step 1: Detect portafilter ellipse
-    ellipse, hole_mode_size = get_portafilter_reference(frames_dir)
+    ellipse, hole_mode_size = get_portafilter_reference(
+        frames_dir,
+        manual_roi=manual_roi,
+        manual_ellipse=manual_ellipse,
+    )
 
     # Step 2: Crop frames
     cropped_frames = crop_frames(frames_dir, output_dir, ellipse)

@@ -199,6 +199,126 @@ def safe_draw_ellipse(img, ellipse, color, thickness=1):
         return
     cv2.ellipse(img, ellipse, color, thickness)
 
+
+def count_keypoints_in_ellipse(ellipse, keypoints, image_shape):
+    if ellipse is None or keypoints is None or len(keypoints) == 0:
+        return 0
+
+    h, w = image_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.ellipse(mask, ellipse, 255, -1)
+
+    count = 0
+    for kp in keypoints:
+        x, y = int(kp.pt[0]), int(kp.pt[1])
+        if 0 <= x < w and 0 <= y < h and mask[y, x] == 255:
+            count += 1
+    return count
+
+
+def _normalize_ellipse(ellipse):
+    if ellipse is None or len(ellipse) != 3:
+        return None
+
+    (cx, cy), (major, minor), angle = ellipse
+    values = [cx, cy, major, minor, angle]
+    if not all(np.isfinite(v) for v in values):
+        return None
+    if major <= 1 or minor <= 1:
+        return None
+
+    return ((float(cx), float(cy)), (float(major), float(minor)), float(angle))
+
+
+def select_manual_ellipse(image, window_name="Manual Portafilter ROI"):
+    # Manual ellipse selector controls:
+    # click+drag = draw, Enter/Space = confirm, r = reset, Esc = cancel
+    if image is None:
+        return None
+
+    display = image.copy()
+    drag_state = {"drawing": False, "start": None, "end": None, "ellipse": None}
+
+    def _draw_overlay(frame):
+        canvas = frame.copy()
+
+        if drag_state["start"] is not None and drag_state["end"] is not None:
+            x1, y1 = drag_state["start"]
+            x2, y2 = drag_state["end"]
+            left, right = sorted([x1, x2])
+            top, bottom = sorted([y1, y2])
+
+            w = right - left
+            h = bottom - top
+            if w > 1 and h > 1:
+                ellipse = (
+                    (left + w / 2.0, top + h / 2.0),
+                    (float(w), float(h)),
+                    0.0,
+                )
+                drag_state["ellipse"] = _normalize_ellipse(ellipse)
+                cv2.rectangle(canvas, (left, top), (right, bottom), (0, 255, 255), 1)
+                safe_draw_ellipse(canvas, drag_state["ellipse"], (0, 255, 0), 2)
+
+        cv2.putText(
+            canvas,
+            "Drag mouse to draw ellipse | Enter=confirm | r=reset | Esc=cancel",
+            (10, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            canvas,
+            "Tip: include the full basket rim and some margin.",
+            (10, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (220, 220, 220),
+            1,
+        )
+        return canvas
+
+    def _on_mouse(event, x, y, flags, param):
+        del flags, param
+        if event == cv2.EVENT_LBUTTONDOWN:
+            drag_state["drawing"] = True
+            drag_state["start"] = (x, y)
+            drag_state["end"] = (x, y)
+            drag_state["ellipse"] = None
+        elif event == cv2.EVENT_MOUSEMOVE and drag_state["drawing"]:
+            drag_state["end"] = (x, y)
+        elif event == cv2.EVENT_LBUTTONUP and drag_state["drawing"]:
+            drag_state["drawing"] = False
+            drag_state["end"] = (x, y)
+
+    try:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(window_name, _on_mouse)
+    except Exception as e:
+        print(f"Could not open manual ROI window: {e}")
+        return None
+
+    selected = None
+    while True:
+        canvas = _draw_overlay(display)
+        cv2.imshow(window_name, canvas)
+        key = cv2.waitKey(20) & 0xFF
+
+        if key in (13, 32):  # Enter or Space
+            if drag_state["ellipse"] is not None:
+                selected = drag_state["ellipse"]
+                break
+            print("No ellipse selected yet. Drag to create one first.")
+        elif key in (ord('r'), ord('R')):
+            drag_state = {"drawing": False, "start": None, "end": None, "ellipse": None}
+        elif key == 27:  # Esc
+            break
+
+    cv2.destroyWindow(window_name)
+    return selected
+
 def ellipse_feature_score(image, lines, circles_list, ellipses, areas, fast_keypoints=None,
                         MIN_FEATURES=5, MIN_AREA=500, MAX_AREA=50000,
                         EMPTY_PENALTY_WEIGHT=50.0):
@@ -477,6 +597,8 @@ def detect_elliptical_portafilter_with_holes(
     use_interactive=True,
     second_frame=None,
     mask_threshold=30,
+    manual_roi=False,
+    manual_ellipse=None,
 ):
     if image is None:
         print(f"Error loading image: {image}")
@@ -496,31 +618,38 @@ def detect_elliptical_portafilter_with_holes(
     
     # Store original image for final cropping
     original_image = image.copy()
+    manual_ellipse = _normalize_ellipse(manual_ellipse)
+
+    if manual_roi and manual_ellipse is None:
+        print("Manual ROI mode enabled. Please select the portafilter ellipse.")
+        manual_ellipse = select_manual_ellipse(original_image)
+        if manual_ellipse is None:
+            print("Manual ROI selection cancelled; falling back to automatic detection.")
     
-    if lap_var > 1000:
-        print(f"WARNING: Image is very sharp (Laplacian variance: {lap_var:.2f}) - blurring with 7")
-        image = cv2.medianBlur(image, 7)
-        debug_images["Blurred"] = image.copy()
-    elif lap_var > 500:
-        print(f"WARNING: Image is too sharp (Laplacian variance: {lap_var:.2f}) - blurring with 5")
-        image = cv2.medianBlur(image, 5)
-        debug_images["Blurred"] = image.copy()
-    elif lap_var < 50:
-        print(f"WARNING: Image is very blurry (Laplacian variance: {lap_var:.2f}) - sharpening")
-        # Sharpening kernel
-        sharpen_kernel = np.array([[0, -3, 0],
-                                [-3, 15, -3],
-                                [0, -3, 0]], dtype=np.float32)
-        image = cv2.filter2D(image, -1, sharpen_kernel)
-        debug_images["Sharpened"] = image.copy()
-    elif lap_var < 100:
-        print(f"WARNING: Image is too blurry (Laplacian variance: {lap_var:.2f}) - sharpening")
-        # Sharpening kernel
-        sharpen_kernel = np.array([[0, -2, 0],
-                                [-2, 9, -2],
-                                [0, -2, 0]], dtype=np.float32)
-        image = cv2.filter2D(image, -1, sharpen_kernel)
-        debug_images["Sharpened"] = image.copy()
+    # if lap_var > 1000:
+    #     print(f"WARNING: Image is very sharp (Laplacian variance: {lap_var:.2f}) - blurring with 7")
+    #     image = cv2.medianBlur(image, 7)
+    #     debug_images["Blurred"] = image.copy()
+    # elif lap_var > 500:
+    #     print(f"WARNING: Image is too sharp (Laplacian variance: {lap_var:.2f}) - blurring with 5")
+    #     image = cv2.medianBlur(image, 5)
+    #     debug_images["Blurred"] = image.copy()
+    # elif lap_var < 50:
+    #     print(f"WARNING: Image is very blurry (Laplacian variance: {lap_var:.2f}) - sharpening")
+    #     # Sharpening kernel
+    #     sharpen_kernel = np.array([[0, -3, 0],
+    #                             [-3, 15, -3],
+    #                             [0, -3, 0]], dtype=np.float32)
+    #     image = cv2.filter2D(image, -1, sharpen_kernel)
+    #     debug_images["Sharpened"] = image.copy()
+    # elif lap_var < 100:
+    #     print(f"WARNING: Image is too blurry (Laplacian variance: {lap_var:.2f}) - sharpening")
+    #     # Sharpening kernel
+    #     sharpen_kernel = np.array([[0, -2, 0],
+    #                             [-2, 9, -2],
+    #                             [0, -2, 0]], dtype=np.float32)
+    #     image = cv2.filter2D(image, -1, sharpen_kernel)
+    #     debug_images["Sharpened"] = image.copy()
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
@@ -637,59 +766,71 @@ def detect_elliptical_portafilter_with_holes(
         x, y = int(kp.pt[0]), int(kp.pt[1])
         cv2.circle(output, (x, y), 3, (255, 0, 0), -1)  # Draw small circles
 
-    # 3. Ellipse Detection from Edges
-    contours, _ = cv2.findContours(el_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     ellipses = []
     areas = []
-    for cnt in contours:
-        if len(cnt) >= 5:
-            ellipse = cv2.fitEllipse(cnt)
-            area = ellipse[1][0] * ellipse[1][1] * np.pi # Calculate the area of the fitted ellipse
-            if area < 50000 :
-                continue
-            if ellipse[1][0] <= 0 or ellipse[1][1] <= 0:
-                continue  # skip bad ellipse
-            (x_len, y_len) = ellipse[1]
-            if x_len <= 0 or y_len <= 0:
-                continue
+    if manual_ellipse is None:
+        # 3. Ellipse Detection from Edges
+        contours, _ = cv2.findContours(el_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            if len(cnt) >= 5:
+                ellipse = cv2.fitEllipse(cnt)
+                area = ellipse[1][0] * ellipse[1][1] * np.pi # Calculate the area of the fitted ellipse
+                if area < 50000 :
+                    continue
+                if ellipse[1][0] <= 0 or ellipse[1][1] <= 0:
+                    continue  # skip bad ellipse
+                (x_len, y_len) = ellipse[1]
+                if x_len <= 0 or y_len <= 0:
+                    continue
 
-            # Reject too flat (line-like) ellipses
-            aspect_ratio = max(x_len, y_len) / min(x_len, y_len)
-            if aspect_ratio > 10 or min(x_len, y_len) < 10:
-                continue
+                # Reject too flat (line-like) ellipses
+                aspect_ratio = max(x_len, y_len) / min(x_len, y_len)
+                if aspect_ratio > 10 or min(x_len, y_len) < 10:
+                    continue
 
-            ellipses.append(ellipse)
-            areas.append(area)
-            safe_draw_ellipse(output, ellipse, (0, 0, 255), 1)
+                ellipses.append(ellipse)
+                areas.append(area)
+                safe_draw_ellipse(output, ellipse, (0, 0, 255), 1)
 
-    # Merge in mask-derived ellipses
-    for m_el, m_area in zip(mask_ellipses, mask_areas):
-        ellipses.append(m_el)
-        areas.append(m_area)
-        safe_draw_ellipse(output, m_el, (0, 255, 0), 1)
+        # Merge in mask-derived ellipses
+        for m_el, m_area in zip(mask_ellipses, mask_areas):
+            ellipses.append(m_el)
+            areas.append(m_area)
+            safe_draw_ellipse(output, m_el, (0, 255, 0), 1)
+    else:
+        safe_draw_ellipse(output, manual_ellipse, (0, 255, 255), 2)
+        debug_images["Manual Ellipse"] = output.copy()
 
     debug_images["Detected Features"] = output
 
     # Step 4: Score and highlight best ellipse with FAST features
-    print("Evaluating ellipses with FAST features")
-    best_ellipse = ellipse_feature_score(image, lines, None, ellipses, areas, filtered_keypoints)
-    if best_ellipse is None and len(ellipses) > 0:
-        print("WARNING: No high-score ellipse found - using largest fallback ellipse.")
-        best_ellipse = max(
-            ellipses,
-            key=lambda el: el[1][0] * el[1][1]  # selects by width × height
-        )
+    if manual_ellipse is not None:
+        best_ellipse = manual_ellipse
+        print("Using manually selected ellipse.")
+    else:
+        print("Evaluating ellipses with FAST features")
+        best_ellipse = ellipse_feature_score(image, lines, None, ellipses, areas, filtered_keypoints)
+        if best_ellipse is None and len(ellipses) > 0:
+            print("WARNING: No high-score ellipse found - using largest fallback ellipse.")
+            best_ellipse = max(
+                ellipses,
+                key=lambda el: el[1][0] * el[1][1]  # selects by width × height
+            )
     
     # Create visualization showing FAST keypoints within the best ellipse
-    if best_ellipse is not None and filtered_keypoints is not None and len(filtered_keypoints) > 0:
+    if (
+        best_ellipse is not None
+        and filtered_keypoints is not None
+        and len(filtered_keypoints) > 0
+        and manual_ellipse is None
+    ):
         # Filter keypoints to only those inside best ellipse
+        best_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+        cv2.ellipse(best_mask, best_ellipse, 255, -1)
         best_ellipse_keypoints = []
         for kp in filtered_keypoints:
             x, y = int(kp.pt[0]), int(kp.pt[1])
-            # Create temporary mask for best ellipse
-            temp_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-            cv2.ellipse(temp_mask, best_ellipse, 255, -1)
-            if 0 <= y < image.shape[0] and 0 <= x < image.shape[1] and temp_mask[y, x] == 255:
+            if 0 <= y < image.shape[0] and 0 <= x < image.shape[1] and best_mask[y, x] == 255:
                 best_ellipse_keypoints.append(kp)
         
         # Draw the best ellipse and its FAST keypoints
@@ -719,36 +860,40 @@ def detect_elliptical_portafilter_with_holes(
         
         print(f"Best ellipse contains {len(best_ellipse_keypoints)} FAST keypoints")
         
-        # Show comparison: all ellipses with their FAST counts
-        comparison_img = image.copy()
-        for i, ellipse in enumerate(ellipses):
-            # Determine color: green for mask-derived, yellow for best, red for others
-            is_mask = any(is_same_ellipse(ellipse, m_el) for m_el in mask_ellipses)
-            is_best = is_same_ellipse(ellipse, best_ellipse)
-            if is_mask:
-                color, thickness = (0, 255, 0), 3
-            elif is_best:
-                color, thickness = (0, 255, 255), 3
-            else:
-                color, thickness = (0, 0, 255), 1
-            
-            safe_draw_ellipse(comparison_img, ellipse, color, thickness)
-            
-            # Count FAST points in this ellipse
-            if filtered_keypoints is not None:
-                ellipse_keypoints = []
-                for kp in filtered_keypoints:
-                    x, y = int(kp.pt[0]), int(kp.pt[1])
-                    temp_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-                    cv2.ellipse(temp_mask, ellipse, 255, -1)
-                    if 0 <= y < image.shape[0] and 0 <= x < image.shape[1] and temp_mask[y, x] == 255:
-                        ellipse_keypoints.append(kp)
+        # Show comparison only when dashboard/debug visualisation is requested.
+        if save_dashboard:
+            comparison_img = image.copy()
+            for ellipse in ellipses:
+                # Determine color: green for mask-derived, yellow for best, red for others
+                is_mask = any(is_same_ellipse(ellipse, m_el) for m_el in mask_ellipses)
+                is_best = is_same_ellipse(ellipse, best_ellipse)
+                if is_mask:
+                    color, thickness = (0, 255, 0), 3
+                elif is_best:
+                    color, thickness = (0, 255, 255), 3
+                else:
+                    color, thickness = (0, 0, 255), 1
+
+                safe_draw_ellipse(comparison_img, ellipse, color, thickness)
+
+                # Count FAST points in this ellipse once per ellipse.
+                ellipse_count = count_keypoints_in_ellipse(ellipse, filtered_keypoints, image.shape)
                 (cx, cy), _, _ = ellipse
-                cv2.putText(comparison_img, f"{len(ellipse_keypoints)}", 
-                            (int(cx-20), int(cy)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        
-        debug_images["Ellipse Comparison"] = comparison_img
+                cv2.putText(
+                    comparison_img,
+                    f"{ellipse_count}",
+                    (int(cx - 20), int(cy)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    1,
+                )
+
+            debug_images["Ellipse Comparison"] = comparison_img
     
+    if best_ellipse is not None and manual_ellipse is not None:
+        safe_draw_ellipse(output2, best_ellipse, (0, 255, 255), 10)
+
     # Also overlay all mask-derived ellipses in green on the final result for clarity
     for m_el in mask_ellipses:
         safe_draw_ellipse(output2, m_el, (0, 255, 0), 4)
@@ -776,6 +921,8 @@ def detect_elliptical_portafilter_with_holes(
         ordered_debug_images["FAST Keypoints"] = debug_images["FAST Keypoints"]
     if "Detected Features" in debug_images:
         ordered_debug_images["Detected Features"] = debug_images["Detected Features"]
+    if "Manual Ellipse" in debug_images:
+        ordered_debug_images["Manual Ellipse"] = debug_images["Manual Ellipse"]
     if "Ellipse Comparison" in debug_images:
         ordered_debug_images["Ellipse Comparison"] = debug_images["Ellipse Comparison"]
     if "Final Result" in debug_images:
