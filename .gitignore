@@ -2,3 +2,5 @@ Image Data/
 Video Data/
 Analysis/
 __pycache__/
+Sync_Dataset.py
+dataset.csv

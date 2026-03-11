@@ -2,22 +2,101 @@ import os
 import cv2
 import numpy as np
 import json
-import math
-import matplotlib.pyplot as plt
+from collections import deque
 from typing import Dict, Tuple, List
 from Portafilter_Detection import detect_elliptical_portafilter_with_holes
 
 # Helpers
 
-base_dir = os.path.dirname(os.path.abspath(__file__))
-crop_dir = os.path.join(base_dir, "Image Data", "Cropped")
-out_dir = os.path.join(base_dir, "Analysis")
-os.makedirs(out_dir, exist_ok=True)
+Base_Dir = os.path.dirname(os.path.abspath(__file__))
+Crop_Dir = os.path.join(Base_Dir, "Image Data", "Cropped")
+Output_Dir = os.path.join(Base_Dir, "Analysis")
+os.makedirs(Output_Dir, exist_ok=True)
 
-def moving_average(x, w=5):
-    if len(x) < w:
-        return np.array(x)
-    return np.convolve(x, np.ones(w)/w, mode='same')
+
+def filter_keypoints_by_size(keypoints, keypoint_sizes, target_size, tolerance=5):
+    if target_size is None:
+        return keypoints
+
+    filtered_keypoints = []
+    for keypoint, size in zip(keypoints, keypoint_sizes):
+        if abs(size - target_size) <= tolerance:
+            filtered_keypoints.append(keypoint)
+    return filtered_keypoints
+
+
+def detect_fast_circles(image, threshold=25, min_circularity=0.4):
+    if image is None or image.size == 0:
+        return [], []
+
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+
+    try:
+        fast_create = getattr(cv2, "FastFeatureDetector_create", None)
+        if fast_create is not None:
+            fast = fast_create(threshold=threshold)
+        else:
+            fast_class = getattr(cv2, "FastFeatureDetector", None)
+            if fast_class is not None:
+                fast = fast_class.create(threshold=threshold)
+            else:
+                raise RuntimeError("No FAST detector available in this OpenCV build")
+
+        keypoints = fast.detect(gray, None)
+    except Exception:
+        return [], []
+
+    if not keypoints:
+        return [], []
+
+    filtered_keypoints = []
+    keypoint_sizes = []
+    height, width = gray.shape[:2]
+
+    for keypoint in keypoints:
+        x, y = int(keypoint.pt[0]), int(keypoint.pt[1])
+        size = int(getattr(keypoint, "size", 20))
+        half_size = max(1, size // 2)
+
+        if x < half_size or y < half_size or x >= width - half_size or y >= height - half_size:
+            continue
+
+        x1, y1 = max(0, x - half_size), max(0, y - half_size)
+        x2, y2 = min(width, x + half_size), min(height, y + half_size)
+        region = gray[y1:y2, x1:x2]
+
+        if region.size == 0:
+            continue
+
+        try:
+            _, binary = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+
+            largest_contour = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(largest_contour)
+            if area <= 0:
+                continue
+
+            perimeter = cv2.arcLength(largest_contour, True)
+            if perimeter <= 0:
+                continue
+
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            if circularity < min_circularity:
+                continue
+
+            filtered_keypoints.append(keypoint)
+            keypoint_sizes.append(size)
+        except Exception:
+            # Keep prior behavior: skip points that fail contour validation.
+            continue
+
+    return filtered_keypoints, keypoint_sizes
 
 def load_frames(folder):
     frame_files = sorted([
@@ -53,6 +132,7 @@ def detect_flow_start_end(
     end_lookback_window: int = 10
 ) -> Tuple[int, int]:
     # Detect the shot start/end window from frame-to-frame changes.
+    # ROI tuple order here is (y1, y2, x1, x2).
     y1, y2, x1, x2 = roi
     roi_area = (y2 - y1) * (x2 - x1)
 
@@ -60,7 +140,6 @@ def detect_flow_start_end(
         raise ValueError("Invalid ROI dimensions")
 
     change_fractions = []
-    change_masks = []
 
     # Calculate frame-to-frame changes
     for i in range(1, len(frames_gray)):
@@ -73,7 +152,6 @@ def detect_flow_start_end(
         change_fraction = np.sum(mask > 0) / roi_area
 
         change_fractions.append(change_fraction)
-        change_masks.append(mask)
 
     # Smooth the change curve to reduce noise
     change_fractions_array = np.array(change_fractions)
@@ -150,188 +228,175 @@ def detect_flow_start_end(
     return start_frame, end_frame
 
 
-def generate_color_change_mask(frame1_bgr, frame2_bgr, threshold=30):
-    # Mask pixels that changed color between two frames
-    if frame1_bgr.shape != frame2_bgr.shape:
-        frame1_bgr = cv2.resize(frame1_bgr, (frame2_bgr.shape[1], frame2_bgr.shape[0]))
+def get_analysis_roi_from_ellipse(ellipse, frame_shape, height_multiplier=2.0):
+    # Build a rectangle from the basket ellipse, then extend downward for the stream.
+    if ellipse is None:
+        return None
 
-    lab1 = cv2.cvtColor(frame1_bgr, cv2.COLOR_BGR2LAB)
-    lab2 = cv2.cvtColor(frame2_bgr, cv2.COLOR_BGR2LAB)
+    frame_h, frame_w = frame_shape[:2]
+    mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
+    cv2.ellipse(mask, ellipse, 255, -1)
 
-    diff = cv2.absdiff(lab1, lab2)
-    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
 
-    _, mask = cv2.threshold(diff_gray, threshold, 255, cv2.THRESH_BINARY)
+    x1 = int(xs.min())
+    x2 = min(int(xs.max()) + 1, frame_w)
+    y1 = int(ys.min())
+    y2 = min(int(ys.max()) + 1, frame_h)
 
+    ellipse_h = y2 - y1
+    if ellipse_h <= 0:
+        return None
+
+    y2 = min(frame_h, y1 + int(ellipse_h * height_multiplier))
+
+    return x1, y1, x2, y2
+
+
+def get_triangle_points_from_roi(roi, frame_shape):
+    # Triangle vertices: left-top, right-top, and bottom-center of ROI rectangle.
+    if roi is None:
+        return None
+
+    frame_h, frame_w = frame_shape[:2]
+    x1, y1, x2, y2 = roi
+    x1 = max(0, int(x1))
+    y1 = max(0, int(y1))
+    x2 = min(frame_w, int(x2))
+    y2 = min(frame_h, int(y2))
+
+    if x1 >= x2 or y1 >= y2:
+        return None
+
+    top_left = (x1, y1)
+    top_right = (x2 - 1, y1)
+    bottom_center = ((x1 + x2) // 2, y2 - 1)
+    return np.array([top_left, top_right, bottom_center], dtype=np.int32)
+
+
+def get_bottom_triangle_points_from_roi(roi, frame_shape, keep_fraction=2.0 / 3.0):
+    # Keep only the lower part of the triangle to focus on the stream path.
+    points = get_triangle_points_from_roi(roi, frame_shape)
+    if points is None:
+        return None
+
+    top_left = points[0].astype(np.float32)
+    top_right = points[1].astype(np.float32)
+    bottom = points[2].astype(np.float32)
+
+    trim_fraction = 1.0 - float(keep_fraction)
+    trim_fraction = min(1.0, max(0.0, trim_fraction))
+    left_cut = top_left + trim_fraction * (bottom - top_left)
+    right_cut = top_right + trim_fraction * (bottom - top_right)
+
+    clipped = np.array(
+        [
+            (int(round(left_cut[0])), int(round(left_cut[1]))),
+            (int(round(right_cut[0])), int(round(right_cut[1]))),
+            (int(round(bottom[0])), int(round(bottom[1]))),
+        ],
+        dtype=np.int32,
+    )
+    return clipped
+
+
+def make_bottom_triangle_mask(frame_shape, roi):
+    if roi is None:
+        return None
+
+    points = get_bottom_triangle_points_from_roi(roi, frame_shape, keep_fraction=2.0 / 3.0)
+    if points is None:
+        return None
+
+    mask = np.zeros(frame_shape[:2], dtype=np.uint8)
+    cv2.fillConvexPoly(mask, points, 255)
     return mask
 
 
-def create_espresso_zone_mask(frames_bgr, start_frame, reference_frame_offset=20, 
-                               color_threshold=30, exclude_bottom_fraction=0.15):
-    # Build a rough mask of where espresso shows up
-    ref_early = frames_bgr[start_frame]
-    ref_late_idx = min(start_frame + reference_frame_offset, len(frames_bgr) - 1)
-    ref_late = frames_bgr[ref_late_idx]
-    
-    espresso_zone = generate_color_change_mask(ref_early, ref_late, threshold=color_threshold)
-    
-    H, W = espresso_zone.shape
-    exclusion_height = int(H * exclude_bottom_fraction)
-    if exclusion_height > 0:
-        espresso_zone[-exclusion_height:, :] = 0
-    
-    return espresso_zone
-
-
-def detect_fast_holes(image, threshold=25, min_circularity=0.4):
-    # Find circular FAST keypoints (holes)
-    try:
-        fast_create = getattr(cv2, 'FastFeatureDetector_create', None)
-        if fast_create is not None:
-            fast = fast_create(threshold=threshold)
-        else:
-            fast_class = getattr(cv2, 'FastFeatureDetector', None)
-            if fast_class is not None:
-                fast = fast_class.create(threshold=threshold)
-            else:
-                raise RuntimeError('No FAST detector available in this OpenCV build')
-        
-        keypoints = fast.detect(image, None)
-    except Exception as e:
-        print(f"FAST detection failed: {e}")
-        return [], []
-    
-    if keypoints:
-        filtered_keypoints = []
-        keypoint_sizes = []
-        height, width = image.shape[:2]
-        
-        for kp in keypoints:
-            x, y = int(kp.pt[0]), int(kp.pt[1])
-            
-            if hasattr(kp, 'size'):
-                size = int(kp.size)
-            else:
-                size = 20
-            
-            if x < size//2 or y < size//2 or x >= width - size//2 or y >= height - size//2:
-                continue
-            
-            x1, y1 = max(0, int(x - size//2)), max(0, int(y - size//2))
-            x2, y2 = min(width, int(x + size//2)), min(height, int(y + size//2))
-            region = image[y1:y2, x1:x2]
-            
-            if region.size == 0:
-                continue
-            
-            try:
-                _, binary = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                if contours:
-                    largest_contour = max(contours, key=cv2.contourArea)
-                    area = cv2.contourArea(largest_contour)
-                    
-                    if area > 0:
-                        perimeter = cv2.arcLength(largest_contour, True)
-                        if perimeter > 0:
-                            circularity = 4 * np.pi * area / (perimeter * perimeter)
-                            
-                            if circularity >= min_circularity:
-                                filtered_keypoints.append(kp)
-                                keypoint_sizes.append(size)
-            except Exception:
-                pass
-        
-        return filtered_keypoints, keypoint_sizes
-    
-    return [], []
-
-
-def find_mode_size(keypoint_sizes, tolerance=5):
-    # Get the most common keypoint size
-    if not keypoint_sizes:
+def make_channeling_roi_mask(frame_shape, portafilter_ellipse=None):
+    # Channeling ROI uses only the basket ellipse.
+    if portafilter_ellipse is None:
         return None
-    
-    # Group sizes within tolerance
-    size_groups = {}
-    for size in keypoint_sizes:
-        grouped = False
-        for group_size in size_groups:
-            if abs(size - group_size) <= tolerance:
-                size_groups[group_size] += 1
-                grouped = True
-                break
-        if not grouped:
-            size_groups[size] = 1
-    
-    # Find the most common size
-    if size_groups:
-        mode_size = max(size_groups.keys(), key=lambda k: size_groups[k])
-        return mode_size
-    
-    return None
+
+    mask = np.zeros(frame_shape[:2], dtype=np.uint8)
+    try:
+        cv2.ellipse(mask, portafilter_ellipse, 255, -1)
+    except Exception:
+        return None
+    return mask
 
 
-def filter_keypoints_by_size(keypoints, keypoint_sizes, target_size, tolerance=5):
-    # Keep only keypoints near the target size
-    if target_size is None:
-        return keypoints
-    
-    filtered_keypoints = []
-    for kp, size in zip(keypoints, keypoint_sizes):
-        if abs(size - target_size) <= tolerance:
-            filtered_keypoints.append(kp)
-    
-    return filtered_keypoints
+def make_blonding_roi_mask(frame_shape, analysis_rect=None, portafilter_ellipse=None):
+    # Blonding ROI is union: ellipse + bottom two-thirds of triangle.
+    union_mask = np.zeros(frame_shape[:2], dtype=np.uint8)
+    has_region = False
 
+    triangle_mask = make_bottom_triangle_mask(frame_shape, analysis_rect)
+    if triangle_mask is not None:
+        union_mask = cv2.bitwise_or(union_mask, triangle_mask)
+        has_region = True
 
-def detect_channeling_in_frame(frame_gray, portafilter_ellipse=None, 
-                                target_hole_size=None, fast_params=None):
+    if portafilter_ellipse is not None:
+        ellipse_mask = np.zeros(frame_shape[:2], dtype=np.uint8)
+        try:
+            cv2.ellipse(ellipse_mask, portafilter_ellipse, 255, -1)
+            union_mask = cv2.bitwise_or(union_mask, ellipse_mask)
+            has_region = True
+        except Exception:
+            pass
+
+    if not has_region:
+        return None
+    return union_mask
+
+def detect_channeling_in_frame(
+    frame_gray,
+    portafilter_ellipse=None,
+    target_hole_size=None,
+    fast_params=None,
+    analysis_rect=None,
+):
     # Count visible holes inside the portafilter ellipse region.
     # Use FAST parameters from portafilter detection to ensure consistency
     if fast_params is None:
         fast_params = {'threshold': 15, 'min_circularity': 0.4, 'size_tolerance': 5}
     
-    mask = None
-    if portafilter_ellipse is not None:
-        H, W = frame_gray.shape
-        mask = np.zeros((H, W), dtype=np.uint8)
-        cv2.ellipse(mask, portafilter_ellipse, 255, -1)
-        
-        # Apply mask to image - zeros out everything outside the ellipse
-        masked_frame = cv2.bitwise_and(frame_gray, frame_gray, mask=mask)
+    frame_h, frame_w = frame_gray.shape
+    # Channeling intentionally ignores the triangle and stays ellipse-only.
+    roi_mask = make_channeling_roi_mask(
+        (frame_h, frame_w),
+        portafilter_ellipse=portafilter_ellipse,
+    )
+
+    if roi_mask is not None:
+        # Apply mask to image - zeros out everything outside ROI
+        masked_frame = cv2.bitwise_and(frame_gray, frame_gray, mask=roi_mask)
     else:
         masked_frame = frame_gray
     
-    # Detect circular features (holes) using exact FAST params from portafilter detection
-    keypoints, keypoint_sizes = detect_fast_holes(
+    # Detect circular features (holes) using exact FAST params from portafilter detection.
+    keypoints, keypoint_sizes = detect_fast_circles(
         masked_frame, 
         threshold=fast_params['threshold'],
         min_circularity=fast_params['min_circularity']
     )
     
-    # Filter keypoints to only those inside the ellipse mask (spatial filtering)
-    if portafilter_ellipse is not None and mask is not None and len(keypoints) > 0:
-        original_count = len(keypoints)
+    # Filter keypoints to only those inside the ROI.
+    if roi_mask is not None and len(keypoints) > 0:
         filtered_by_roi = []
         filtered_sizes_by_roi = []
-        
+
         for kp, size in zip(keypoints, keypoint_sizes):
             x, y = int(kp.pt[0]), int(kp.pt[1])
-            # Check if keypoint is within image bounds and inside the ellipse
-            if 0 <= y < H and 0 <= x < W and mask[y, x] == 255:
+            # Keep only keypoints that are inside the analysis ROI
+            if 0 <= y < frame_h and 0 <= x < frame_w and roi_mask[y, x] == 255:
                 filtered_by_roi.append(kp)
                 filtered_sizes_by_roi.append(size)
         
         keypoints = filtered_by_roi
         keypoint_sizes = filtered_sizes_by_roi
-        
-        # Debug: show how many keypoints were filtered out by ROI
-        if original_count > len(keypoints):
-            filtered_out = original_count - len(keypoints)
-            # Only print occasionally to avoid spam
-            # print(f"Filtered out {filtered_out} keypoints outside ellipse ROI")
     
     # Filter to target hole size using the same tolerance from portafilter detection
     if target_hole_size is not None and len(keypoints) > 0:
@@ -341,6 +406,9 @@ def detect_channeling_in_frame(frame_gray, portafilter_ellipse=None,
             target_hole_size, 
             tolerance=fast_params['size_tolerance']
         )
+        if len(filtered_keypoints) == 0:
+            # Keep the overlay usable even when detected point sizes drift briefly.
+            filtered_keypoints = keypoints
     else:
         filtered_keypoints = keypoints
     
@@ -354,9 +422,10 @@ def compute_stream_mask(prev_gray,
                         brightness_thresh=130,
                         min_component_area=30,
                         motion_fraction_thresh=0.3,
-                        exclude_bottom_fraction=0.15,
-                        espresso_zone_mask=None):
-    # Build a mask for the stream using motion and color
+                        exclude_bottom_fraction=0.0,
+                        analysis_rect=None,
+                        portafilter_ellipse=None):
+    # Stream mask = moving dark pixels, then clipped to blonding ROI union.
 
     H, W = curr_gray.shape
 
@@ -370,9 +439,6 @@ def compute_stream_mask(prev_gray,
 
     combined_mask = (dark_mask > 0) & motion_mask
     combined_mask = combined_mask.astype(np.uint8) * 255
-
-    if espresso_zone_mask is not None:
-        combined_mask = cv2.bitwise_or(combined_mask, espresso_zone_mask)
 
     exclusion_height = int(H * exclude_bottom_fraction)
     if exclusion_height > 0:
@@ -405,7 +471,49 @@ def compute_stream_mask(prev_gray,
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel)
 
+    roi_mask = make_blonding_roi_mask(
+        (H, W),
+        analysis_rect=analysis_rect,
+        portafilter_ellipse=portafilter_ellipse,
+    )
+    if roi_mask is not None:
+        final_mask = cv2.bitwise_and(final_mask, roi_mask)
+
     return final_mask
+
+
+def draw_analysis_roi_on_frame(frame, analysis_rect, portafilter_ellipse=None, include_triangle=False):
+    if analysis_rect is None and portafilter_ellipse is None:
+        return frame
+
+    label_x = 10
+    label_y = 28
+    if include_triangle:
+        points = get_bottom_triangle_points_from_roi(analysis_rect, frame.shape[:2], keep_fraction=2.0 / 3.0)
+        if points is not None:
+            cv2.polylines(frame, [points], isClosed=True, color=(0, 255, 255), thickness=2)
+            label_x = int(points[2][0]) - 15
+            label_y = max(18, int(points[2][1]) - 8)
+
+    if portafilter_ellipse is not None:
+        try:
+            cv2.ellipse(frame, portafilter_ellipse, (0, 255, 255), 2)
+            label_x = int(portafilter_ellipse[0][0]) - 20
+            label_y = max(18, int(portafilter_ellipse[0][1]) - 12)
+        except Exception:
+            pass
+
+    cv2.putText(
+        frame,
+        "ROI",
+        (label_x, label_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return frame
 
 
 def extract_colour_and_blonding(frames_bgr,
@@ -413,20 +521,16 @@ def extract_colour_and_blonding(frames_bgr,
                                 start_frame,
                                 end_frame,
                                 fps=1.0,
-                                plot=True,
-                                plot_output_blond_path=None,
-                                plot_output_channeling_path=None,
-                                mask_history=2,
-                                use_color_zone_mask=True,
-                                zone_reference_offset=20,
-                                zone_color_threshold=30,
+                                mask_history=None,
                                 detect_channeling=True,
                                 portafilter_ellipse=None,
                                 target_hole_size=None,
                                 fast_params=None,
-                                show_gui=True):
-    # Track stream color and optional channeling over time
-    # Extract FAST parameters from portafilter detection (use defaults if not provided)
+                                show_gui=True,
+                                capture_frames=False,
+                                analysis_roi=None):
+    # Track stream colour statistics frame-by-frame and derive blonding timing/rate.
+    # Reuse FAST settings from portafilter detection so both stages stay in sync.
     if fast_params is None:
         fast_params = {'threshold': 15, 'min_circularity': 0.4, 'size_tolerance': 5}
 
@@ -437,54 +541,95 @@ def extract_colour_and_blonding(frames_bgr,
     saturation_curve = []
     hue_curve = []
     channeling_counts = []
-    espresso_zone_mask = None
-    if use_color_zone_mask:
-        print("Creating espresso zone mask from color change...")
-        espresso_zone_mask = create_espresso_zone_mask(
-            frames_bgr,
-            start_frame,
-            reference_frame_offset=zone_reference_offset,
-            color_threshold=zone_color_threshold,
-            exclude_bottom_fraction=0.15
+    channeling_frames = []
+
+    if analysis_roi is None and portafilter_ellipse is not None:
+        analysis_roi = get_analysis_roi_from_ellipse(
+            portafilter_ellipse,
+            frames_bgr[0].shape,
+            height_multiplier=2.0,
         )
-        print(f"Espresso zone covers {np.sum(espresso_zone_mask > 0)} pixels")
-        
-        if show_gui:
-            cv2.imshow("Espresso Zone Mask", espresso_zone_mask)
+
+    if analysis_roi is None:
+        frame_h, frame_w = frames_bgr[0].shape[:2]
+        analysis_roi = (0, 0, frame_w, frame_h)
+
+    frame_shape = frames_bgr[0].shape[:2]
+    channel_roi_mask = make_channeling_roi_mask(
+        frame_shape,
+        portafilter_ellipse=portafilter_ellipse,
+    )
+    blond_roi_mask = make_blonding_roi_mask(
+        frame_shape,
+        analysis_rect=analysis_roi,
+        portafilter_ellipse=portafilter_ellipse,
+    )
+    channel_roi_pixels = int(np.count_nonzero(channel_roi_mask)) if channel_roi_mask is not None else 0
+    blond_roi_pixels = int(np.count_nonzero(blond_roi_mask)) if blond_roi_mask is not None else 0
+
+    if show_gui:
+        print(f"Analysis ROI: x1={analysis_roi[0]}, y1={analysis_roi[1]}, x2={analysis_roi[2]}, y2={analysis_roi[3]}")
 
     prev_gray = frames_gray[start_frame]
-    mask_history_buffer = []
+    # Preserve prior blonding behavior by default (accumulate over full shot).
+    if mask_history is None:
+        history_len = max(1, end_frame - start_frame + 1)
+    else:
+        history_len = max(1, int(mask_history))
+    mask_history_buffer = deque(maxlen=history_len)
     for t in range(start_frame + 1, end_frame + 1):
-
         curr_bgr = frames_bgr[t]
         curr_gray = frames_gray[t]
+
+        vis_frame = curr_bgr.copy()
+        hole_count = 0
+        hole_keypoints = []
+
         if detect_channeling:
             hole_count, hole_keypoints = detect_channeling_in_frame(
                 curr_gray,
                 portafilter_ellipse=portafilter_ellipse,
                 target_hole_size=target_hole_size,
-                fast_params=fast_params
+                fast_params=fast_params,
+                analysis_rect=analysis_roi,
             )
-            channeling_counts.append(hole_count)
-            
             if hole_count > 0:
-                vis_frame = curr_bgr.copy()
-                cv2.drawKeypoints(vis_frame, hole_keypoints, vis_frame, 
-                                color=(0, 0, 255), 
-                                flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-                cv2.putText(vis_frame, f"Holes: {hole_count}", 
-                          (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                          1, (0, 0, 255), 2)
-                if show_gui:
-                    cv2.imshow("Channeling Detection", vis_frame)
-        else:
-            channeling_counts.append(0)
+                cv2.drawKeypoints(
+                    vis_frame,
+                    hole_keypoints,
+                    vis_frame,
+                    color=(0, 0, 255),
+                    flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS,
+                )
+
+        channeling_counts.append(hole_count)
+        draw_analysis_roi_on_frame(
+            vis_frame,
+            analysis_roi,
+            portafilter_ellipse=portafilter_ellipse,
+        )
+        text = f"Holes: {hole_count}"
+        text_font = cv2.FONT_HERSHEY_SIMPLEX
+        text_scale = 1
+        text_thickness = 2
+        text_size, text_baseline = cv2.getTextSize(text, text_font, text_scale, text_thickness)
+        frame_h, frame_w = vis_frame.shape[:2]
+        x = max(12, frame_w - text_size[0] - 12)
+        y = frame_h - 12 - text_baseline
+        cv2.putText(vis_frame, text, (x, y), text_font, text_scale, (0, 0, 0), 4)
+        cv2.putText(vis_frame, text, (x, y), text_font, text_scale, (0, 255, 0), text_thickness)
+
+        if capture_frames:
+            channeling_frames.append(vis_frame.copy())
+        if show_gui:
+            cv2.imshow("Channeling Detection", vis_frame)
 
         stream_mask = compute_stream_mask(
             prev_gray,
             curr_gray,
             curr_bgr,
-            espresso_zone_mask=espresso_zone_mask
+            analysis_rect=analysis_roi,
+            portafilter_ellipse=portafilter_ellipse,
         )
 
         mask_history_buffer.append(stream_mask)
@@ -539,100 +684,57 @@ def extract_colour_and_blonding(frames_bgr,
         mode='same'
     )
 
+    # Blonding point is where brightness rises fastest after the initial pour transient.
     derivative = np.gradient(norm_brightness)
-    blond_idx = np.nanargmax(derivative)
-    blond_rate = derivative[blond_idx]
+    derivative = np.convolve(derivative, np.ones(3) / 3, mode='same')
+
+    sample_count = len(norm_brightness)
+    warmup = min(max(3, int(sample_count * 0.15)), max(0, sample_count - 1))
+    candidate_indices = np.arange(warmup, sample_count)
+    if len(candidate_indices) == 0:
+        candidate_indices = np.arange(sample_count)
+
+    # Ignore very dark early values to avoid false blonding picks during flow onset.
+    brightness_gate = norm_brightness[candidate_indices] >= 0.25
+    gated_indices = candidate_indices[brightness_gate]
+    if len(gated_indices) > 0:
+        candidate_indices = gated_indices
+
+    blond_idx = int(candidate_indices[np.argmax(derivative[candidate_indices])])
+    blond_rate = float(derivative[blond_idx])
 
     blond_frame = start_frame + 1 + blond_idx
 
-    if plot:
-        time_axis = np.arange(len(norm_brightness)) / fps
-
-        if detect_channeling and len(channeling_counts) > 0:
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-            
-            ax1.plot(time_axis, norm_brightness, label="Brightness (norm)")
-            ax1.plot(time_axis, saturation_curve / 255.0, label="Saturation (norm)")
-            ax1.axvline(
-                x=(blond_frame - start_frame) / fps,
-                color='r',
-                linestyle='--',
-                label="Blonding point"
-            )
-            ax1.set_xlabel("Time (s)")
-            ax1.set_ylabel("Normalised Value")
-            ax1.set_title("Espresso Stream Colour Transition")
-            ax1.legend()
-            ax1.grid(True, alpha=0.3)
-            
-            channeling_array = np.array(channeling_counts)
-            ax2.plot(time_axis, channeling_array, color='red', linewidth=2, label="Visible Holes")
-            ax2.fill_between(time_axis, channeling_array, alpha=0.3, color='red')
-            ax2.set_xlabel("Time (s)")
-            ax2.set_ylabel("Hole Count")
-            ax2.set_title("Channeling Detection (Visible Portafilter Holes)")
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-            
-            avg_holes = np.mean(channeling_array)
-            max_holes = np.max(channeling_array)
-            ax2.text(0.02, 0.98, f"Avg holes: {avg_holes:.1f}\nMax holes: {max_holes}", 
-                    transform=ax2.transAxes, verticalalignment='top',
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-            
-            plt.tight_layout()
-            if plot_output_blond_path:
-                plt.savefig(plot_output_blond_path, dpi=150, bbox_inches='tight')
-                print(f"Blonding plot saved to {plot_output_blond_path}")
-            if plot_output_channeling_path:
-                # Save just the channeling subplot
-                fig2, ax2_save = plt.subplots(figsize=(12, 5))
-                ax2_save.plot(time_axis, channeling_array, color='red', linewidth=2, label="Visible Holes")
-                ax2_save.fill_between(time_axis, channeling_array, alpha=0.3, color='red')
-                ax2_save.set_xlabel("Time (s)")
-                ax2_save.set_ylabel("Hole Count")
-                ax2_save.set_title("Channeling Detection (Visible Portafilter Holes)")
-                ax2_save.legend()
-                ax2_save.grid(True, alpha=0.3)
-                ax2_save.text(0.02, 0.98, f"Avg holes: {avg_holes:.1f}\nMax holes: {max_holes}", 
-                            transform=ax2_save.transAxes, verticalalignment='top',
-                            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-                plt.tight_layout()
-                fig2.savefig(plot_output_channeling_path, dpi=150, bbox_inches='tight')
-                print(f"Channeling plot saved to {plot_output_channeling_path}")
-                plt.close(fig2)
-            if show_gui:
-                plt.show()
-            plt.close(fig)
-        else:
-            fig = plt.figure(figsize=(10, 5))
-            plt.plot(time_axis, norm_brightness, label="Brightness (norm)")
-            plt.plot(time_axis, saturation_curve / 255.0, label="Saturation (norm)")
-            plt.axvline(
-                x=(blond_frame - start_frame) / fps,
-                color='r',
-                linestyle='--',
-                label="Blonding point"
-            )
-            plt.xlabel("Time (s)")
-            plt.ylabel("Normalised Value")
-            plt.title("Espresso Stream Colour Transition")
-            plt.legend()
-            plt.tight_layout()
-            if plot_output_blond_path:
-                fig.savefig(plot_output_blond_path, dpi=150, bbox_inches='tight')
-                print(f"Blonding plot saved to {plot_output_blond_path}")
-            if show_gui:
-                plt.show()
-            plt.close(fig)
+    # Keep this function non-blocking and GUI-safe by avoiding matplotlib output.
+    # Plotting and saving files are now handled in the application layer.
 
     return {
         "brightness_curve": brightness_curve,
         "saturation_curve": saturation_curve,
         "hue_curve": hue_curve,
+        "blond_score_curve": norm_brightness,
         "blond_frame": blond_frame,
         "blond_rate": float(blond_rate),
-        "channeling_counts": channeling_counts
+        "channeling_counts": channeling_counts,
+        "channeling_frames": channeling_frames if capture_frames else None,
+        "start_frame": start_frame,
+        "end_frame": end_frame,
+        "fps": fps,
+        "analysis_roi": {
+            "x1": int(analysis_roi[0]),
+            "y1": int(analysis_roi[1]),
+            "x2": int(analysis_roi[2]),
+            "y2": int(analysis_roi[3]),
+        },
+        "channel_roi_pixels": channel_roi_pixels,
+        "blond_roi_pixels": blond_roi_pixels,
+        "portafilter_ellipse": {
+            "cx": float(portafilter_ellipse[0][0]),
+            "cy": float(portafilter_ellipse[0][1]),
+            "width": float(portafilter_ellipse[1][0]),
+            "height": float(portafilter_ellipse[1][1]),
+            "angle": float(portafilter_ellipse[2]),
+        } if portafilter_ellipse is not None else None,
     }
 
 
@@ -644,27 +746,27 @@ def extract_features_from_video(cropped_frames_dir=None,
                                output_results_dir=None,
                                save_plots=True,
                                detect_channeling=True,
-                               show_gui=True):
+                               show_gui=True,
+                               capture_channeling_frames=True,
+                               portafilter_override_ellipse=None,
+                               portafilter_override_hole_size=None,
+                               portafilter_override_fast_params=None):
     # Extract blonding and channeling features from cropped frames.
     if cropped_frames_dir is None:
-        cropped_frames_dir = crop_dir
+        cropped_frames_dir = Crop_Dir
     if output_dir is None:
-        output_dir = out_dir
-    if output_blond_dir is None:
-        output_blond_dir = output_dir
-    if output_channeling_dir is None:
-        output_channeling_dir = output_dir
+        output_dir = Output_Dir
     if output_results_dir is None:
         output_results_dir = output_dir
 
-    print(f"Loading frames from {cropped_frames_dir}")
+    print(f"Loading frames")
     frames_bgr, frames_gray, frame_names = load_frames(cropped_frames_dir)
     print(f"Loaded {len(frames_gray)} frames")
 
     H, W = frames_gray[0].shape
     roi = (0, H, 0, W)
 
-    print("Detecting flow start/end...")
+    print("Detecting flow start/end")
     start_frame, end_frame = detect_flow_start_end(
         frames_gray=frames_gray,
         roi=roi,
@@ -676,7 +778,7 @@ def extract_features_from_video(cropped_frames_dir=None,
         end_lookback_window=10          # Rolling average for robust end detection
     )
 
-    print("\n===== FLOW DETECTION RESULT =====")
+    print("\nFlow Detection Results:")
     print(f"Flow start frame index : {start_frame}")
     print(f"Flow end frame index   : {end_frame}")
     print(f"Shot duration (frames) : {end_frame - start_frame + 1}")
@@ -684,60 +786,75 @@ def extract_features_from_video(cropped_frames_dir=None,
     print(f"End frame file         : {frame_names[end_frame]}")
 
     # Detect portafilter for the cropped ROI context
-    print("Detecting portafilter ellipse for channeling detection...")
-    pf_second_idx = min(start_frame + 20, len(frames_bgr) - 1)
-    pf_second_frame = frames_bgr[pf_second_idx] if pf_second_idx > start_frame else None
+    fast_params = portafilter_override_fast_params
+    if portafilter_override_ellipse is not None:
+        print("Using overridden portafilter ellipse for channeling detection.")
+        portafilter_ellipse = portafilter_override_ellipse
+        hole_mode_size = portafilter_override_hole_size
+    else:
+        print("Detecting portafilter ellipse for channeling detection...")
+        pf_second_idx = min(start_frame + 20, len(frames_bgr) - 1)
+        pf_second_frame = frames_bgr[pf_second_idx] if pf_second_idx > start_frame else None
 
-    _, portafilter_ellipse, hole_mode_size, fast_params = detect_elliptical_portafilter_with_holes(
-        frames_bgr[start_frame],
-        save_dashboard=False,
-        use_interactive=False,
-        second_frame=pf_second_frame,
-        mask_threshold=15,
-    )
-    
-    print(f"Using FAST detection params from portafilter: threshold={fast_params['threshold']}, "
-          f"circularity={fast_params['min_circularity']}, tolerance={fast_params['size_tolerance']}")
+        _, portafilter_ellipse, hole_mode_size, fast_params = detect_elliptical_portafilter_with_holes(
+            frames_bgr[start_frame],
+            save_dashboard=False,
+            use_interactive=False,
+            second_frame=pf_second_frame,
+            mask_threshold=15,
+        )
 
-    print("Extracting color and blonding features...")
-    
-    # Prepare output paths
-    plot_output_blond_path = None
-    plot_output_channeling_path = None
-    if save_plots:
-        os.makedirs(output_blond_dir, exist_ok=True)
-        plot_output_blond_path = os.path.join(output_blond_dir, f"{video_name}_Blond.png")
+    if fast_params is None:
+        fast_params = {'threshold': 15, 'min_circularity': 0.4, 'size_tolerance': 5}
 
-        if detect_channeling:
-            os.makedirs(output_channeling_dir, exist_ok=True)
-            plot_output_channeling_path = os.path.join(output_channeling_dir, f"{video_name}_Channeling.png")
-    
+    print("Extracting color and blonding features")
+
     colour_results = extract_colour_and_blonding(
         frames_bgr,
         frames_gray,
         start_frame=start_frame,
         end_frame=end_frame,
         fps=1.0,
-        plot=True,
-        plot_output_blond_path=plot_output_blond_path,
-        plot_output_channeling_path=plot_output_channeling_path,
         detect_channeling=detect_channeling,
         portafilter_ellipse=portafilter_ellipse,
         target_hole_size=hole_mode_size,
         fast_params=fast_params,
-        show_gui=show_gui
+        show_gui=show_gui,
+        capture_frames=capture_channeling_frames
     )
 
-    print("\n===== BLONDING AND CHANNELING FEATURES =====")
+    print("\nBlonding And Channeling Results:")
     if colour_results:
+        def to_json_curve(values):
+            # Convert numpy-heavy arrays to plain JSON-safe lists.
+            if values is None:
+                return []
+            serialised = []
+            for value in values:
+                try:
+                    number = float(value)
+                    if np.isnan(number):
+                        serialised.append(None)
+                    else:
+                        serialised.append(number)
+                except Exception:
+                    serialised.append(None)
+            return serialised
+
+        channeling_counts = to_json_curve(colour_results.get("channeling_counts"))
+        valid_channeling = [v for v in channeling_counts if v is not None]
+
         for k, v in colour_results.items():
             if k == "channeling_counts":
-                channeling_array = np.array(v)
-                print(f"Channeling stats:")
-                print(f"  - Average visible holes: {np.mean(channeling_array):.2f}")
-                print(f"  - Max visible holes: {np.max(channeling_array)}")
-                print(f"  - Min visible holes: {np.min(channeling_array)}")
-            elif k not in ["brightness_curve", "saturation_curve", "hue_curve"]:
+                if valid_channeling:
+                    channeling_array = np.array(valid_channeling, dtype=float)
+                    print(f"Channeling stats:")
+                    print(f"  - Average visible holes: {np.mean(channeling_array):.2f}")
+                    print(f"  - Max visible holes: {np.max(channeling_array):.0f}")
+                    print(f"  - Min visible holes: {np.min(channeling_array):.0f}")
+                else:
+                    print("Channeling stats: no valid hole detections")
+            elif k not in ["brightness_curve", "saturation_curve", "hue_curve", "blond_score_curve", "channeling_frames"]:
                 print(f"{k}: {v}")
         
         # Save results as JSON
@@ -747,10 +864,21 @@ def extract_features_from_video(cropped_frames_dir=None,
             "blond_rate": float(colour_results["blond_rate"]) if colour_results.get("blond_rate") is not None else None,
             "flow_start": int(start_frame),
             "flow_end": int(end_frame),
-            "total_frames": len(frames_gray)
+            "total_frames": len(frames_gray),
+            "fps": float(colour_results.get("fps", 1.0) or 1.0),
+            "analysis_roi": colour_results.get("analysis_roi"),
+            "channel_roi_pixels": int(colour_results.get("channel_roi_pixels") or 0),
+            "blond_roi_pixels": int(colour_results.get("blond_roi_pixels") or 0),
+            "portafilter_ellipse": colour_results.get("portafilter_ellipse"),
+            "target_hole_size": float(hole_mode_size) if hole_mode_size is not None else None,
+            "brightness_curve": to_json_curve(colour_results.get("brightness_curve")),
+            "saturation_curve": to_json_curve(colour_results.get("saturation_curve")),
+            "hue_curve": to_json_curve(colour_results.get("hue_curve")),
+            "blond_score_curve": to_json_curve(colour_results.get("blond_score_curve")),
+            "channeling_counts": channeling_counts,
         }
-        if "channeling_counts" in colour_results:
-            channeling_array = np.array(colour_results["channeling_counts"])
+        if valid_channeling:
+            channeling_array = np.array(valid_channeling, dtype=float)
             results_json["channeling_stats"] = {
                 "average": float(np.mean(channeling_array)),
                 "max": int(np.max(channeling_array)),

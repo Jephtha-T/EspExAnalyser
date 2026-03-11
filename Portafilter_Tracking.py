@@ -3,10 +3,10 @@ import numpy as np
 import os
 from Portafilter_Detection import detect_elliptical_portafilter_with_holes, load_image_with_orientation
 
-base_dir = os.path.dirname(os.path.abspath(__file__))
-input_dir = os.path.join(base_dir, "Image Data", "Frames")
-crop_dir = os.path.join(base_dir, "Image Data", "Cropped")
-os.makedirs(crop_dir, exist_ok=True)
+Base_Dir = os.path.dirname(os.path.abspath(__file__))
+Input_Dir = os.path.join(Base_Dir, "Image Data", "Frames")
+Crop_Dir = os.path.join(Base_Dir, "Image Data", "Cropped")
+os.makedirs(Crop_Dir, exist_ok=True)
 
 
 def get_portafilter_reference(frames_dir, manual_roi=False, manual_ellipse=None):
@@ -42,7 +42,7 @@ def get_portafilter_reference(frames_dir, manual_roi=False, manual_ellipse=None)
     print("Portafilter ellipse detected")
     print(f"Hole mode size: {hole_mode_size}")
 
-    return ellipse, hole_mode_size
+    return ellipse, hole_mode_size, fast_params
 
 
 def get_crop_bounds(frame_shape, ellipse, padding=12):
@@ -59,8 +59,18 @@ def get_crop_bounds(frame_shape, ellipse, padding=12):
     x2 = min(int(xs.max()) + padding + 1, w)
     y1 = max(int(ys.min()) - padding, 0)
     y2 = h  # keep stream below basket
-
+    
     return x1, y1, x2, y2
+
+
+def ellipse_in_crop_coords(ellipse, crop_bounds):
+    # Convert a full-frame ellipse to crop-frame coordinates.
+    if ellipse is None:
+        return None
+
+    x1, y1, _, _ = crop_bounds
+    (cx, cy), axes, angle = ellipse
+    return (cx - x1, cy - y1), axes, angle
 
 
 def crop_roi(frame, crop_bounds):
@@ -79,7 +89,7 @@ def crop_frames(frames_dir, output_dir, ellipse):
     if len(frame_files) < 2:
         raise RuntimeError("Not enough frames for processing")
 
-    print("Loading and cropping frames with fixed ROI bounds...")
+    print("Loading and cropping frames")
     first_frame = load_image_with_orientation(os.path.join(frames_dir, frame_files[0]))
     crop_bounds = get_crop_bounds(first_frame.shape, ellipse, padding=12)
 
@@ -92,45 +102,73 @@ def crop_frames(frames_dir, output_dir, ellipse):
         frame = load_image_with_orientation(os.path.join(frames_dir, fname))
         roi = crop_roi(frame, crop_bounds)
         if roi.shape[:2] != (target_h, target_w):
+            # Keep frame size consistent so downstream analysis can index safely.
             roi = cv2.resize(roi, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
         cropped_frames.append((fname, roi))
 
     print(f"Loaded {len(cropped_frames)} cropped frames")
 
     # Save cropped frames
-    print("Saving cropped frames...")
+    print("Saving cropped frames")
     os.makedirs(output_dir, exist_ok=True)
     for i, (fname, frame) in enumerate(cropped_frames):
         output_path = os.path.join(output_dir, f"frame_{i:04d}.jpg")
         cv2.imwrite(output_path, frame)
 
-    print(f"Saved {len(cropped_frames)} cropped frames to {output_dir}")
+    print(f"Saved {len(cropped_frames)} cropped frames")
     return cropped_frames
 
 
 def process_portafilter_tracking(frames_dir=None, output_dir=None, manual_roi=False, manual_ellipse=None):
     # Detect the basket and crop all frames to a stable ROI.
     if frames_dir is None:
-        frames_dir = input_dir
+        frames_dir = Input_Dir
     if output_dir is None:
-        output_dir = crop_dir
+        output_dir = Crop_Dir
+    frame_files = sorted([f for f in os.listdir(frames_dir) if f.lower().endswith((".jpg", ".png"))])
+    if not frame_files:
+        raise RuntimeError("No frames found in directory")
+    reference_frame = load_image_with_orientation(os.path.join(frames_dir, frame_files[0]))
 
-    print(f"Input frames directory: {frames_dir}")
-    print(f"Output directory: {output_dir}")
+    # Step 1: Detect or use the supplied portafilter ellipse.
+    if manual_ellipse is not None:
+        ellipse = manual_ellipse
 
-    # Step 1: Detect portafilter ellipse
-    ellipse, hole_mode_size = get_portafilter_reference(
-        frames_dir,
-        manual_roi=manual_roi,
-        manual_ellipse=manual_ellipse,
-    )
+        # Manual ROI still needs FAST params so channeling uses the same detector setup.
+        second_frame = None
+        second_idx = min(20, len(frame_files) - 1)
+        second_frame = load_image_with_orientation(os.path.join(frames_dir, frame_files[second_idx]))
+
+        try:
+            _, _, hole_mode_size, fast_params = detect_elliptical_portafilter_with_holes(
+                reference_frame,
+                save_dashboard=False,
+                use_interactive=False,
+                second_frame=second_frame,
+                mask_threshold=15,
+                manual_ellipse=ellipse,
+            )
+        except Exception as exc:
+            print(f"Manual ROI FAST parameter derivation failed: {exc}")
+            hole_mode_size = None
+            fast_params = {'threshold': 15, 'min_circularity': 0.4, 'size_tolerance': 5}
+    else:
+        ellipse, hole_mode_size, fast_params = get_portafilter_reference(
+            frames_dir,
+            manual_roi=manual_roi,
+            manual_ellipse=manual_ellipse,
+        )
 
     # Step 2: Crop frames
+    crop_bounds = get_crop_bounds(reference_frame.shape, ellipse, padding=12)
     cropped_frames = crop_frames(frames_dir, output_dir, ellipse)
+    ellipse_crop_coords = ellipse_in_crop_coords(ellipse, crop_bounds)
 
     return {
         "ellipse": ellipse,
+        "ellipse_in_crop": ellipse_crop_coords,
         "hole_mode_size": hole_mode_size,
+        "fast_params": fast_params,
         "output_dir": output_dir,
         "frame_count": len(cropped_frames)
     }
@@ -142,5 +180,3 @@ if __name__ == "__main__":
     print(f"Ellipse: {result['ellipse']}")
     print(f"Hole mode size: {result['hole_mode_size']}")
     print(f"Frames processed: {result['frame_count']}")
-
-
