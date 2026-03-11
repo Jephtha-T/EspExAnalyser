@@ -14,7 +14,7 @@ from Portafilter_Detection import (
     detect_elliptical_portafilter_with_holes,
     load_image_with_orientation,
 )
-from Portafilter_Tracking import process_portafilter_tracking
+from Portafilter_Tracking_v2 import process_portafilter_tracking_v2
 from Feature_Extraction import extract_features_from_video
 from Data_Export import export_to_csv
 
@@ -569,7 +569,7 @@ class EspressoAnalysisApp:
     def _run_full_pipeline(self, video_path, manual_ellipse, manual_mode_size=None, manual_fast_params=None):
         try:
             # Stage 3: crop all frames to a stable ROI based on approved ellipse.
-            tracking_result = process_portafilter_tracking(
+            tracking_result = process_portafilter_tracking_v2(
                 frames_dir=frames_dir,
                 output_dir=cropped_dir,
                 manual_roi=False,
@@ -931,7 +931,7 @@ class EspressoAnalysisApp:
             try:
                 clear_image_data()
                 extract_frames(video_path, frames_dir, target_fps=1)
-                tracking_result = process_portafilter_tracking(
+                tracking_result = process_portafilter_tracking_v2(
                     frames_dir=frames_dir,
                     output_dir=cropped_dir,
                 )
