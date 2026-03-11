@@ -846,6 +846,11 @@ class EspressoAnalysisApp:
 
         self._anim_label = ttk.Label(vis_frame)
         self._anim_label.pack(padx=12, pady=12)
+        ttk.Button(
+            vis_frame,
+            text="Export Results CSV",
+            command=self._export_results,
+        ).pack(anchor="center", pady=(0, 10))
 
         shot_label = ttk.Label(
             self.workspace,
@@ -857,7 +862,6 @@ class EspressoAnalysisApp:
         btns = ttk.Frame(self.workspace)
         btns.pack(fill="x", pady=10, padx=10)
 
-        ttk.Button(btns, text="Export Results CSV", command=self._export_results).pack(side="left", padx=6)
         ttk.Button(btns, text="Run another video", command=self._build_start_screen).pack(side="left", padx=6)
         ttk.Button(btns, text="Close", command=self.root.destroy).pack(side="left", padx=6)
 
