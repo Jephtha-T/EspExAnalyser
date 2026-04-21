@@ -28,7 +28,7 @@ The UI shows 5 review images in one row:
 User can draw a manual ellipse in the same app before full analysis.
 
 4. Portafilter tracking/cropping  
-`Portafilter_Tracking.py` crops all frames to a stable basket-aligned region.
+`Portafilter_Tracking_v2.py` tracks the basket across the sequence and saves a locked ROI crop so the portafilter stays stable for downstream analysis.
 
 5. Feature extraction  
 `Feature_Extraction.py` computes:
@@ -55,7 +55,8 @@ EspExAnalyser/
 |-- Espresso_Analysis.py       # Main Tkinter app (single window workflow)
 |-- Frame_Extraction.py        # Video -> frames extraction
 |-- Portafilter_Detection.py   # Basket ellipse detection + debug outputs
-|-- Portafilter_Tracking.py    # Consistent cropping based on detected ellipse
+|-- Portafilter_Tracking.py    # Legacy fixed crop implementation
+|-- Portafilter_Tracking_v2.py # Basket-tracked ROI locking for analysis
 |-- Feature_Extraction.py      # Blonding/channeling feature extraction
 |-- Data_Export.py             # Export analysis outputs to training CSV
 |-- Espresso_Model.py          # Training/inference utilities for model experiments

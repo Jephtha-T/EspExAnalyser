@@ -28,124 +28,57 @@ def load_all_frames(frames_dir, frame_files):
     return frames
 
 
-def estimate_ecc_euclidean(template_gray, input_gray):
-    # ECC gives robust global alignment for small camera motion.
-    warp_matrix = np.eye(2, 3, dtype=np.float32)
-    criteria = (
-        cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-        80,
-        1e-5,
+def preprocess_tracking_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    return cv2.equalizeHist(gray)
+
+
+def crop_with_padding(image, bounds):
+    x1, y1, x2, y2 = [int(v) for v in bounds]
+    target_w = max(1, x2 - x1)
+    target_h = max(1, y2 - y1)
+
+    src_x1 = max(0, x1)
+    src_y1 = max(0, y1)
+    src_x2 = min(image.shape[1], x2)
+    src_y2 = min(image.shape[0], y2)
+
+    cropped = image[src_y1:src_y2, src_x1:src_x2]
+    if cropped.size == 0:
+        if image.ndim == 2:
+            return np.zeros((target_h, target_w), dtype=image.dtype)
+        return np.zeros((target_h, target_w, image.shape[2]), dtype=image.dtype)
+
+    pad_left = max(0, src_x1 - x1)
+    pad_top = max(0, src_y1 - y1)
+    pad_right = max(0, x2 - src_x2)
+    pad_bottom = max(0, y2 - src_y2)
+
+    if pad_left == 0 and pad_top == 0 and pad_right == 0 and pad_bottom == 0:
+        return cropped
+
+    return cv2.copyMakeBorder(
+        cropped,
+        pad_top,
+        pad_bottom,
+        pad_left,
+        pad_right,
+        borderType=cv2.BORDER_REPLICATE,
     )
 
-    try:
-        cv2.findTransformECC(
-            template_gray,
-            input_gray,
-            warp_matrix,
-            cv2.MOTION_EUCLIDEAN,
-            criteria,
-            None,
-            1,
-        )
-        return warp_matrix
-    except cv2.error:
-        return None
 
+def get_portafilter_template_bounds(frame_shape, ellipse, padding=18):
+    h, w = frame_shape[:2]
+    (cx, cy), (major_axis, minor_axis), _ = ellipse
+    half_w = max(12, int(round(major_axis / 2.0 + padding)))
+    half_h = max(12, int(round(minor_axis / 2.0 + padding)))
 
-def estimate_affine_with_optical_flow(input_gray, template_gray):
-    # Fallback when ECC fails: sparse optical flow + robust affine fit.
-    points = cv2.goodFeaturesToTrack(
-        input_gray,
-        maxCorners=400,
-        qualityLevel=0.01,
-        minDistance=8,
-        blockSize=7,
-    )
-    if points is None or len(points) < 12:
-        return None
-
-    tracked, status, _ = cv2.calcOpticalFlowPyrLK(
-        input_gray,
-        template_gray,
-        points,
-        None,
-        winSize=(21, 21),
-        maxLevel=3,
-        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-    )
-    if tracked is None or status is None:
-        return None
-
-    valid = status.reshape(-1) == 1
-    if int(np.sum(valid)) < 10:
-        return None
-
-    src_pts = points[valid].reshape(-1, 2)
-    dst_pts = tracked[valid].reshape(-1, 2)
-    affine, _ = cv2.estimateAffinePartial2D(
-        src_pts,
-        dst_pts,
-        method=cv2.RANSAC,
-        ransacReprojThreshold=3.0,
-        maxIters=3000,
-        confidence=0.99,
-    )
-    return affine
-
-
-def stabilise_frames(frames):
-    # Stabilise all frames to frame 0 so basket detection/cropping stays consistent.
-    if len(frames) < 2:
-        return frames, {"ecc_success": 0, "flow_success": 0, "identity_fallback": 0}
-
-    ref_frame = frames[0]
-    h, w = ref_frame.shape[:2]
-    ref_gray = cv2.cvtColor(ref_frame, cv2.COLOR_BGR2GRAY)
-    ref_gray = cv2.GaussianBlur(ref_gray, (3, 3), 0)
-
-    stabilised = [ref_frame.copy()]
-    ecc_success = 0
-    flow_success = 0
-    identity_fallback = 0
-
-    for frame in frames[1:]:
-        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        curr_gray = cv2.GaussianBlur(curr_gray, (3, 3), 0)
-
-        warp_matrix = estimate_ecc_euclidean(ref_gray, curr_gray)
-        if warp_matrix is not None:
-            aligned = cv2.warpAffine(
-                frame,
-                warp_matrix,
-                (w, h),
-                flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
-                borderMode=cv2.BORDER_REPLICATE,
-            )
-            ecc_success += 1
-            stabilised.append(aligned)
-            continue
-
-        affine = estimate_affine_with_optical_flow(curr_gray, ref_gray)
-        if affine is not None:
-            aligned = cv2.warpAffine(
-                frame,
-                affine,
-                (w, h),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_REPLICATE,
-            )
-            flow_success += 1
-            stabilised.append(aligned)
-            continue
-
-        stabilised.append(frame.copy())
-        identity_fallback += 1
-
-    return stabilised, {
-        "ecc_success": ecc_success,
-        "flow_success": flow_success,
-        "identity_fallback": identity_fallback,
-    }
+    x1 = max(0, int(round(cx)) - half_w)
+    x2 = min(w, int(round(cx)) + half_w)
+    y1 = max(0, int(round(cy)) - half_h)
+    y2 = min(h, int(round(cy)) + half_h)
+    return x1, y1, x2, y2
 
 
 def get_crop_bounds(frame_shape, ellipse, padding=12):
@@ -173,14 +106,177 @@ def ellipse_in_crop_coords(ellipse, crop_bounds):
     return (cx - x1, cy - y1), axes, angle
 
 
-def detect_reference_ellipse(stabilised_frames, manual_roi=False, manual_ellipse=None):
-    if len(stabilised_frames) == 0:
+def get_centered_bounds(center, width, height):
+    cx, cy = center
+    x1 = int(round(cx - width / 2.0))
+    y1 = int(round(cy - height / 2.0))
+    return x1, y1, x1 + int(width), y1 + int(height)
+
+
+def locate_template_center(
+    current_gray,
+    template_gray,
+    previous_center,
+    reference_center,
+    frame_shape,
+):
+    template_h, template_w = template_gray.shape[:2]
+    margin_x = max(24, int(round(template_w * 0.9)))
+    margin_y = max(24, int(round(template_h * 0.9)))
+    search_w = template_w + 2 * margin_x
+    search_h = template_h + 2 * margin_y
+
+    best_center = None
+    best_score = -1.0
+    best_source = "previous"
+    seen_sources = set()
+
+    for source_name, anchor in (
+        ("previous", previous_center),
+        ("reference", reference_center),
+    ):
+        rounded_anchor = (int(round(anchor[0])), int(round(anchor[1])))
+        if rounded_anchor in seen_sources:
+            continue
+        seen_sources.add(rounded_anchor)
+
+        search_bounds = get_centered_bounds(anchor, search_w, search_h)
+        search_patch = crop_with_padding(current_gray, search_bounds)
+        if search_patch.shape[0] < template_h or search_patch.shape[1] < template_w:
+            continue
+
+        result = cv2.matchTemplate(search_patch, template_gray, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+        if max_val > best_score:
+            best_score = float(max_val)
+            best_center = (
+                float(search_bounds[0] + max_loc[0] + template_w / 2.0),
+                float(search_bounds[1] + max_loc[1] + template_h / 2.0),
+            )
+            best_source = source_name
+
+    if best_center is None:
+        best_center = previous_center
+        best_score = 0.0
+        best_source = "fallback"
+
+    frame_h, frame_w = frame_shape[:2]
+    clamped_center = (
+        min(max(best_center[0], 0.0), float(frame_w - 1)),
+        min(max(best_center[1], 0.0), float(frame_h - 1)),
+    )
+    return clamped_center, best_score, best_source
+
+
+def update_filtered_center(previous_center, measured_center, score):
+    alpha = float(np.clip((float(score) - 0.35) / 0.45, 0.22, 1.0))
+    return (
+        previous_center[0] + alpha * (measured_center[0] - previous_center[0]),
+        previous_center[1] + alpha * (measured_center[1] - previous_center[1]),
+    )
+
+
+def track_portafilter_motion(frames, ellipse):
+    if len(frames) == 0:
+        raise RuntimeError("No frames available for tracking")
+
+    reference_center = (float(ellipse[0][0]), float(ellipse[0][1]))
+    tracking_grays = [preprocess_tracking_frame(frame) for frame in frames]
+
+    template_bounds = get_portafilter_template_bounds(frames[0].shape, ellipse, padding=18)
+    template_gray = crop_with_padding(tracking_grays[0], template_bounds)
+    template_h, template_w = template_gray.shape[:2]
+
+    measured_centers = [reference_center]
+    filtered_centers = [reference_center]
+    match_scores = [1.0]
+    template_updates = 0
+    reference_searches = 0
+    low_confidence_fallbacks = 0
+
+    for index in range(1, len(frames)):
+        measured_center, score, source = locate_template_center(
+            tracking_grays[index],
+            template_gray,
+            filtered_centers[-1],
+            reference_center,
+            frames[index].shape,
+        )
+
+        if source == "reference":
+            reference_searches += 1
+        if score < 0.40:
+            low_confidence_fallbacks += 1
+            measured_center = filtered_centers[-1]
+
+        filtered_center = update_filtered_center(filtered_centers[-1], measured_center, score)
+
+        measured_centers.append(measured_center)
+        filtered_centers.append(filtered_center)
+        match_scores.append(float(score))
+
+        if score >= 0.60:
+            fresh_bounds = get_centered_bounds(measured_center, template_w, template_h)
+            fresh_template = crop_with_padding(tracking_grays[index], fresh_bounds)
+            template_gray = cv2.addWeighted(template_gray, 0.85, fresh_template, 0.15, 0.0)
+            template_updates += 1
+
+    displacements = [
+        float(np.hypot(center[0] - reference_center[0], center[1] - reference_center[1]))
+        for center in filtered_centers
+    ]
+
+    return {
+        "reference_center": reference_center,
+        "measured_centers": measured_centers,
+        "filtered_centers": filtered_centers,
+        "match_scores": match_scores,
+        "template_shape": (template_h, template_w),
+        "template_updates": template_updates,
+        "reference_searches": reference_searches,
+        "low_confidence_fallbacks": low_confidence_fallbacks,
+        "average_match_score": float(np.mean(match_scores)) if match_scores else 0.0,
+        "max_center_displacement": float(max(displacements)) if displacements else 0.0,
+    }
+
+
+def crop_frame_locked(frame, center, reference_crop_bounds, reference_center):
+    ref_x1, ref_y1, ref_x2, ref_y2 = reference_crop_bounds
+    left_offset = float(reference_center[0] - ref_x1)
+    right_offset = float(ref_x2 - reference_center[0])
+    top_offset = float(reference_center[1] - ref_y1)
+    bottom_offset = float(ref_y2 - reference_center[1])
+
+    crop_bounds = (
+        int(round(center[0] - left_offset)),
+        int(round(center[1] - top_offset)),
+        int(round(center[0] + right_offset)),
+        int(round(center[1] + bottom_offset)),
+    )
+    return crop_with_padding(frame, crop_bounds)
+
+
+def save_locked_crops(frames, output_dir, reference_crop_bounds, reference_center, centers):
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("Saving locked ROI crops (v2)")
+    for index, (frame, center) in enumerate(zip(frames, centers)):
+        roi = crop_frame_locked(frame, center, reference_crop_bounds, reference_center)
+        output_path = os.path.join(output_dir, f"frame_{index:04d}.jpg")
+        cv2.imwrite(output_path, roi)
+
+    print(f"Saved {len(centers)} cropped frames")
+
+
+def detect_reference_ellipse(frames, manual_roi=False, manual_ellipse=None):
+    if len(frames) == 0:
         raise RuntimeError("No frames available for detection")
 
-    frame1 = stabilised_frames[0]
-    frame2 = stabilised_frames[min(20, len(stabilised_frames) - 1)]
+    frame1 = frames[0]
+    frame2 = frames[min(20, len(frames) - 1)]
 
-    print("Detecting portafilter ellipse (v2, after stabilisation)...")
+    print("Detecting portafilter ellipse...")
     _, ellipse, hole_mode_size, fast_params = detect_elliptical_portafilter_with_holes(
         frame1,
         save_dashboard=False,
@@ -194,27 +290,9 @@ def detect_reference_ellipse(stabilised_frames, manual_roi=False, manual_ellipse
     if ellipse is None:
         raise RuntimeError("Portafilter detection failed")
 
-    print("Portafilter ellipse detected (v2)")
+    print("Portafilter ellipse detected")
     print(f"Hole mode size: {hole_mode_size}")
     return ellipse, hole_mode_size, fast_params
-
-
-def save_cropped_frames(stabilised_frames, output_dir, crop_bounds):
-    x1, y1, x2, y2 = crop_bounds
-    target_h = y2 - y1
-    target_w = x2 - x1
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    print("Saving v2 cropped frames")
-    for index, frame in enumerate(stabilised_frames):
-        roi = frame[y1:y2, x1:x2]
-        if roi.shape[:2] != (target_h, target_w):
-            roi = cv2.resize(roi, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        output_path = os.path.join(output_dir, f"frame_{index:04d}.jpg")
-        cv2.imwrite(output_path, roi)
-
-    print(f"Saved {len(stabilised_frames)} cropped frames")
 
 
 def process_portafilter_tracking_v2(
@@ -224,7 +302,6 @@ def process_portafilter_tracking_v2(
     manual_ellipse=None,
     stabilise_before_detection=True,
 ):
-    # Stabilise frames first, then detect/crop using the stabilised sequence.
     if frames_dir is None:
         frames_dir = Input_Dir
     if output_dir is None:
@@ -238,21 +315,8 @@ def process_portafilter_tracking_v2(
     if len(frames) < 2:
         raise RuntimeError("Not enough frames for tracking")
 
-    if stabilise_before_detection:
-        print("Stabilising frames before portafilter detection (v2)")
-        stabilised_frames, stabilise_stats = stabilise_frames(frames)
-        print(
-            "Stabilisation stats: "
-            f"ecc={stabilise_stats['ecc_success']}, "
-            f"flow={stabilise_stats['flow_success']}, "
-            f"fallback={stabilise_stats['identity_fallback']}"
-        )
-    else:
-        stabilised_frames = frames
-        stabilise_stats = {"ecc_success": 0, "flow_success": 0, "identity_fallback": 0}
-
-    reference_frame = stabilised_frames[0]
-    second_frame = stabilised_frames[min(20, len(stabilised_frames) - 1)]
+    reference_frame = frames[0]
+    second_frame = frames[min(20, len(frames) - 1)]
 
     if manual_ellipse is not None:
         ellipse = manual_ellipse
@@ -271,13 +335,48 @@ def process_portafilter_tracking_v2(
             fast_params = {"threshold": 15, "min_circularity": 0.4, "size_tolerance": 5}
     else:
         ellipse, hole_mode_size, fast_params = detect_reference_ellipse(
-            stabilised_frames,
+            frames,
             manual_roi=manual_roi,
             manual_ellipse=manual_ellipse,
         )
 
     crop_bounds = get_crop_bounds(reference_frame.shape, ellipse, padding=12)
-    save_cropped_frames(stabilised_frames, output_dir, crop_bounds)
+    reference_center = (float(ellipse[0][0]), float(ellipse[0][1]))
+
+    if stabilise_before_detection:
+        print("Tracking basket motion and locking the ROI (v2)")
+        tracking = track_portafilter_motion(frames, ellipse)
+        crop_centers = tracking["filtered_centers"]
+        print(
+            "Tracking stats: "
+            f"avg_score={tracking['average_match_score']:.3f}, "
+            f"template_updates={tracking['template_updates']}, "
+            f"reference_searches={tracking['reference_searches']}, "
+            f"fallbacks={tracking['low_confidence_fallbacks']}"
+        )
+    else:
+        tracking = {
+            "reference_center": reference_center,
+            "measured_centers": [reference_center for _ in frames],
+            "filtered_centers": [reference_center for _ in frames],
+            "match_scores": [1.0 for _ in frames],
+            "template_shape": None,
+            "template_updates": 0,
+            "reference_searches": 0,
+            "low_confidence_fallbacks": 0,
+            "average_match_score": 1.0,
+            "max_center_displacement": 0.0,
+        }
+        crop_centers = tracking["filtered_centers"]
+
+    save_locked_crops(
+        frames,
+        output_dir,
+        reference_crop_bounds=crop_bounds,
+        reference_center=reference_center,
+        centers=crop_centers,
+    )
+
     ellipse_crop_coords = ellipse_in_crop_coords(ellipse, crop_bounds)
 
     return {
@@ -286,8 +385,15 @@ def process_portafilter_tracking_v2(
         "hole_mode_size": hole_mode_size,
         "fast_params": fast_params,
         "output_dir": output_dir,
-        "frame_count": len(stabilised_frames),
-        "stabilisation": stabilise_stats,
+        "frame_count": len(frames),
+        "stabilisation": {
+            "method": "roi_template_lock",
+            "average_match_score": tracking["average_match_score"],
+            "template_updates": tracking["template_updates"],
+            "reference_searches": tracking["reference_searches"],
+            "low_confidence_fallbacks": tracking["low_confidence_fallbacks"],
+            "max_center_displacement": tracking["max_center_displacement"],
+        },
     }
 
 
@@ -310,7 +416,6 @@ def run_tracking_v2_on_video(
     target_fps=1,
     clear_dirs=True,
 ):
-    # Standalone test helper: extract frames from a video, then run v2 tracking.
     if not os.path.isfile(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
 
@@ -343,7 +448,7 @@ def run_tracking_v2_on_video(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Portafilter tracking v2 (stabilise first)")
+    parser = argparse.ArgumentParser(description="Portafilter tracking v2 (ROI lock)")
     parser.add_argument("--video", type=str, default="", help="Path to input video for modular test")
     parser.add_argument("--frames-dir", type=str, default=Input_Dir, help="Working extracted frames directory")
     parser.add_argument("--output-dir", type=str, default=Crop_Dir, help="Output cropped frames directory")
