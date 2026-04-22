@@ -2,5 +2,6 @@ Image Data/
 Video Data/
 Analysis/
 __pycache__/
+yolo_portafilter/
 Sync_Dataset.py
 dataset.csv
