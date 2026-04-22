@@ -129,103 +129,151 @@ def detect_flow_start_end(
     start_consec_frames: int = 2,
     end_consec_frames: int = 5,
     smoothing_window: int = 3,
-    end_lookback_window: int = 10
-) -> Tuple[int, int]:
-    # Detect the shot start/end window from frame-to-frame changes.
-    # ROI tuple order here is (y1, y2, x1, x2).
+    end_lookback_window: int = 10,
+) -> Tuple[int, int, Dict[str, object]]:
+    # Detect shot start/end from frame changes using adaptive thresholds and hysteresis.
     y1, y2, x1, x2 = roi
     roi_area = (y2 - y1) * (x2 - x1)
-
     if roi_area <= 0:
         raise ValueError("Invalid ROI dimensions")
 
-    change_fractions = []
+    if len(frames_gray) < 2:
+        metrics = {
+            "start_threshold": float(change_fraction_thresh),
+            "end_threshold": float(change_fraction_thresh) * 0.5,
+            "baseline_noise": 0.0,
+            "peak_change": 0.0,
+            "mean_change_during_shot": 0.0,
+            "start_confidence": 0.0,
+            "end_confidence": 0.0,
+            "quality_score": 0.0,
+            "quality_flags": ["insufficient_frames"],
+        }
+        return 0, 0, metrics
 
-    # Calculate frame-to-frame changes
+    change_fractions = []
     for i in range(1, len(frames_gray)):
         prev = frames_gray[i - 1][y1:y2, x1:x2].astype(np.int16)
         curr = frames_gray[i][y1:y2, x1:x2].astype(np.int16)
-
         diff = np.abs(curr - prev)
-        mask = (diff > pixel_diff_thresh).astype(np.uint8) * 255
-
-        change_fraction = np.sum(mask > 0) / roi_area
-
+        change_fraction = float(np.sum(diff > pixel_diff_thresh) / roi_area)
         change_fractions.append(change_fraction)
 
-    # Smooth the change curve to reduce noise
-    change_fractions_array = np.array(change_fractions)
-    if len(change_fractions_array) >= smoothing_window:
-        smoothed_changes = np.convolve(
-            change_fractions_array, 
-            np.ones(smoothing_window) / smoothing_window, 
-            mode='same'
-        )
+    change_fractions_array = np.array(change_fractions, dtype=np.float32)
+    if len(change_fractions_array) >= max(2, smoothing_window):
+        kernel = np.ones(int(max(1, smoothing_window)), dtype=np.float32)
+        kernel /= np.sum(kernel)
+        smoothed_changes = np.convolve(change_fractions_array, kernel, mode="same")
     else:
-        smoothed_changes = change_fractions_array
+        smoothed_changes = change_fractions_array.copy()
 
-    # Detect flow start using smoothed curve
+    baseline_len = min(max(4, int(len(smoothed_changes) * 0.18)), max(1, len(smoothed_changes) // 2))
+    baseline = smoothed_changes[:baseline_len] if baseline_len > 0 else smoothed_changes
+    baseline_med = float(np.median(baseline)) if len(baseline) > 0 else 0.0
+    baseline_mad = float(np.median(np.abs(baseline - baseline_med))) if len(baseline) > 0 else 0.0
+    baseline_sigma = 1.4826 * baseline_mad
+
+    start_threshold = float(max(change_fraction_thresh, baseline_med + 4.0 * baseline_sigma))
+    start_threshold = float(min(start_threshold, max(change_fraction_thresh * 3.0, np.max(smoothed_changes) * 0.90)))
+    end_threshold = float(max(baseline_med + 2.0 * baseline_sigma, start_threshold * 0.45))
+    if end_threshold >= start_threshold:
+        end_threshold = max(change_fraction_thresh * 0.5, start_threshold * 0.7)
+
     start_frame = None
     consec = 0
-
     for i, frac in enumerate(smoothed_changes):
-        if frac >= change_fraction_thresh:
+        if float(frac) >= start_threshold:
             consec += 1
             if consec >= start_consec_frames:
-                # Go back to find the actual start (before smoothing effect)
                 start_frame = max(0, i - start_consec_frames + 1)
                 break
         else:
             consec = 0
 
     if start_frame is None:
-        print("Warning: no flow start detected, using frame 0")
-        return 0, len(frames_gray) - 1
+        peak_idx = int(np.argmax(smoothed_changes)) if len(smoothed_changes) else 0
+        if len(smoothed_changes) and float(smoothed_changes[peak_idx]) >= change_fraction_thresh:
+            start_frame = max(0, peak_idx - 1)
+        else:
+            metrics = {
+                "start_threshold": start_threshold,
+                "end_threshold": end_threshold,
+                "baseline_noise": float(baseline_sigma),
+                "peak_change": float(np.max(smoothed_changes)) if len(smoothed_changes) else 0.0,
+                "mean_change_during_shot": float(np.mean(smoothed_changes)) if len(smoothed_changes) else 0.0,
+                "start_confidence": 0.0,
+                "end_confidence": 0.0,
+                "quality_score": 0.0,
+                "quality_flags": ["no_flow_start_detected"],
+            }
+            return 0, len(frames_gray) - 1, metrics
 
-    # Detect flow end - use a more sophisticated approach for choked shots
-    # Look for sustained low activity rather than immediate cutoff
-    end_frame = len(frames_gray) - 1  # fallback to last frame
-    
-    # Calculate a rolling average to smooth out temporary dips
-    window_size = min(end_lookback_window, len(smoothed_changes) - start_frame)
-    
-    if window_size >= 3:
-        rolling_avg = []
-        for i in range(start_frame, len(smoothed_changes)):
-            window_start = max(start_frame, i - window_size + 1)
-            window_data = smoothed_changes[window_start:i+1]
-            rolling_avg.append(np.mean(window_data))
-        
-        # Find where rolling average drops below threshold for extended period
-        consec = 0
-        for i, avg in enumerate(rolling_avg):
-            actual_idx = start_frame + i
-            if avg < change_fraction_thresh * 0.5:  # Lower threshold for end detection
-                consec += 1
-                if consec >= end_consec_frames:
-                    end_frame = actual_idx - consec + 1
-                    break
-            else:
-                consec = 0
+    peak_relative = int(np.argmax(smoothed_changes[start_frame:])) if start_frame < len(smoothed_changes) else 0
+    peak_idx = start_frame + peak_relative
+
+    end_frame = len(frames_gray) - 1
+    lookback = max(3, int(end_lookback_window))
+    consec = 0
+    for i in range(max(start_frame + 1, peak_idx), len(smoothed_changes)):
+        window_start = max(start_frame, i - lookback + 1)
+        rolling_mean = float(np.mean(smoothed_changes[window_start:i + 1]))
+        if rolling_mean <= end_threshold:
+            consec += 1
+            if consec >= end_consec_frames:
+                end_frame = i - consec + 1
+                break
+        else:
+            consec = 0
+
+    end_frame = int(max(start_frame, min(end_frame, len(frames_gray) - 1)))
+
+    shot_slice = smoothed_changes[start_frame:end_frame + 1] if end_frame >= start_frame else smoothed_changes
+    peak_change = float(np.max(shot_slice)) if len(shot_slice) else 0.0
+    mean_change = float(np.mean(shot_slice)) if len(shot_slice) else 0.0
+
+    start_level = float(np.mean(smoothed_changes[start_frame:min(len(smoothed_changes), start_frame + start_consec_frames + 1)]))
+    start_confidence = float(np.clip((start_level - start_threshold) / (max(1e-6, peak_change - baseline_med)), 0.0, 1.0))
+
+    if end_frame < len(smoothed_changes) - 1:
+        post_window = smoothed_changes[end_frame + 1:min(len(smoothed_changes), end_frame + 1 + lookback)]
+        post_level = float(np.mean(post_window)) if len(post_window) else float(smoothed_changes[end_frame])
     else:
-        # Fallback to simple consecutive frame counting
-        consec = 0
-        for i in range(start_frame, len(smoothed_changes)):
-            if smoothed_changes[i] < change_fraction_thresh * 0.5:
-                consec += 1
-                if consec >= end_consec_frames:
-                    end_frame = i - consec + 1
-                    break
-            else:
-                consec = 0
+        post_level = float(smoothed_changes[end_frame - 1]) if end_frame > 0 else baseline_med
+    end_drop = max(0.0, peak_change - post_level)
+    end_confidence = float(np.clip(end_drop / max(1e-6, peak_change - baseline_med), 0.0, 1.0))
 
-    end_frame = max(end_frame, start_frame)
-    
+    quality_flags = []
+    if start_confidence < 0.35:
+        quality_flags.append("low_start_confidence")
+    if end_confidence < 0.35:
+        quality_flags.append("low_end_confidence")
+    if start_frame == 0:
+        quality_flags.append("start_near_first_frame")
+    if end_frame >= len(frames_gray) - 2:
+        quality_flags.append("end_near_last_frame")
+    if (end_frame - start_frame + 1) < max(6, int(len(frames_gray) * 0.08)):
+        quality_flags.append("very_short_flow_window")
+    if peak_change < max(change_fraction_thresh * 1.15, start_threshold * 1.05):
+        quality_flags.append("weak_motion_signal")
+
+    quality_score = float(np.clip((start_confidence + end_confidence) * 0.5 - 0.08 * len(quality_flags), 0.0, 1.0))
+
     print(f"Flow detection: start={start_frame}, end={end_frame}, duration={end_frame - start_frame + 1} frames")
-    print(f"Peak change fraction: {np.max(smoothed_changes[start_frame:end_frame+1]):.4f}")
-    print(f"Mean change fraction during shot: {np.mean(smoothed_changes[start_frame:end_frame+1]):.4f}")
+    print(f"Peak change fraction: {peak_change:.4f}")
+    print(f"Mean change fraction during shot: {mean_change:.4f}")
 
-    return start_frame, end_frame
+    metrics = {
+        "start_threshold": start_threshold,
+        "end_threshold": end_threshold,
+        "baseline_noise": float(baseline_sigma),
+        "peak_change": peak_change,
+        "mean_change_during_shot": mean_change,
+        "start_confidence": start_confidence,
+        "end_confidence": end_confidence,
+        "quality_score": quality_score,
+        "quality_flags": quality_flags,
+    }
+    return start_frame, end_frame, metrics
 
 
 def get_analysis_roi_from_ellipse(ellipse, frame_shape, height_multiplier=2.0):
@@ -326,6 +374,100 @@ def make_channeling_roi_mask(frame_shape, portafilter_ellipse=None):
     except Exception:
         return None
     return mask
+
+
+def _ellipse_local_xy(points_x, points_y, ellipse):
+    cx, cy = ellipse[0]
+    angle_deg = float(ellipse[2])
+    theta = np.deg2rad(angle_deg)
+    cos_t = float(np.cos(theta))
+    sin_t = float(np.sin(theta))
+
+    dx = points_x.astype(np.float32) - float(cx)
+    dy = points_y.astype(np.float32) - float(cy)
+    x_local = dx * cos_t + dy * sin_t
+    y_local = -dx * sin_t + dy * cos_t
+    return x_local, y_local
+
+
+def make_channeling_quadrant_masks(frame_shape, portafilter_ellipse=None):
+    # Build four ellipse-local quadrant masks (top-left/top-right/bottom-left/bottom-right).
+    quadrant_masks = {
+        "top_left": np.zeros(frame_shape[:2], dtype=np.uint8),
+        "top_right": np.zeros(frame_shape[:2], dtype=np.uint8),
+        "bottom_left": np.zeros(frame_shape[:2], dtype=np.uint8),
+        "bottom_right": np.zeros(frame_shape[:2], dtype=np.uint8),
+    }
+    quadrant_areas = {key: 0 for key in quadrant_masks.keys()}
+
+    ellipse_mask = make_channeling_roi_mask(frame_shape, portafilter_ellipse=portafilter_ellipse)
+    if ellipse_mask is None:
+        return quadrant_masks, quadrant_areas
+
+    ys, xs = np.where(ellipse_mask > 0)
+    if len(xs) == 0:
+        return quadrant_masks, quadrant_areas
+
+    x_local, y_local = _ellipse_local_xy(xs, ys, portafilter_ellipse)
+    is_left = x_local < 0
+    is_top = y_local < 0
+
+    idx_tl = is_left & is_top
+    idx_tr = (~is_left) & is_top
+    idx_bl = is_left & (~is_top)
+    idx_br = (~is_left) & (~is_top)
+
+    quadrant_masks["top_left"][ys[idx_tl], xs[idx_tl]] = 255
+    quadrant_masks["top_right"][ys[idx_tr], xs[idx_tr]] = 255
+    quadrant_masks["bottom_left"][ys[idx_bl], xs[idx_bl]] = 255
+    quadrant_masks["bottom_right"][ys[idx_br], xs[idx_br]] = 255
+
+    for key, mask in quadrant_masks.items():
+        quadrant_areas[key] = int(np.count_nonzero(mask))
+
+    return quadrant_masks, quadrant_areas
+
+
+def count_channeling_quadrants(keypoints, portafilter_ellipse=None):
+    counts = {
+        "top_left": 0,
+        "top_right": 0,
+        "bottom_left": 0,
+        "bottom_right": 0,
+    }
+    if portafilter_ellipse is None or not keypoints:
+        return counts
+
+    xs = np.array([kp.pt[0] for kp in keypoints], dtype=np.float32)
+    ys = np.array([kp.pt[1] for kp in keypoints], dtype=np.float32)
+    x_local, y_local = _ellipse_local_xy(xs, ys, portafilter_ellipse)
+
+    for idx in range(len(xs)):
+        is_left = bool(x_local[idx] < 0)
+        is_top = bool(y_local[idx] < 0)
+        if is_left and is_top:
+            counts["top_left"] += 1
+        elif (not is_left) and is_top:
+            counts["top_right"] += 1
+        elif is_left and (not is_top):
+            counts["bottom_left"] += 1
+        else:
+            counts["bottom_right"] += 1
+
+    return counts
+
+
+def _spatial_entropy_from_counts(counts_dict):
+    values = np.array(list(counts_dict.values()), dtype=np.float32)
+    total = float(np.sum(values))
+    if total <= 0.0:
+        return 0.0
+    probs = values / total
+    probs = probs[probs > 0]
+    if len(probs) == 0:
+        return 0.0
+    # Normalise by log2(4) so output is in [0, 1].
+    return float((-np.sum(probs * np.log2(probs))) / 2.0)
 
 
 def make_blonding_roi_mask(frame_shape, analysis_rect=None, portafilter_ellipse=None):
@@ -857,6 +999,7 @@ def detect_channeling_in_frame(
         threshold=fast_params['threshold'],
         min_circularity=fast_params['min_circularity']
     )
+    raw_count = int(len(keypoints))
     
     # Filter keypoints to only those inside the ROI.
     if roi_mask is not None and len(keypoints) > 0:
@@ -872,6 +1015,7 @@ def detect_channeling_in_frame(
         
         keypoints = filtered_by_roi
         keypoint_sizes = filtered_sizes_by_roi
+    roi_filtered_count = int(len(keypoints))
     
     # Filter to target hole size using the same tolerance from portafilter detection
     if target_hole_size is not None and len(keypoints) > 0:
@@ -886,8 +1030,28 @@ def detect_channeling_in_frame(
             filtered_keypoints = keypoints
     else:
         filtered_keypoints = keypoints
-    
-    return len(filtered_keypoints), filtered_keypoints
+
+    filtered_count = int(len(filtered_keypoints))
+    if target_hole_size is not None and roi_filtered_count > 0:
+        size_match_ratio = float(filtered_count / max(1, roi_filtered_count))
+    else:
+        size_match_ratio = 1.0
+
+    base_conf = 0.20 + 0.55 * min(1.0, filtered_count / 6.0) + 0.25 * min(1.0, size_match_ratio)
+    if roi_mask is None:
+        base_conf *= 0.7
+    detection_confidence = float(np.clip(base_conf, 0.0, 1.0))
+
+    metadata = {
+        "raw_keypoints": raw_count,
+        "roi_filtered_keypoints": roi_filtered_count,
+        "final_keypoints": filtered_count,
+        "size_match_ratio": float(size_match_ratio),
+        "roi_area_px": int(np.count_nonzero(roi_mask)) if roi_mask is not None else 0,
+        "detection_confidence": detection_confidence,
+    }
+
+    return filtered_count, filtered_keypoints, metadata
 
 
 def compute_stream_mask(prev_gray,
@@ -1134,6 +1298,70 @@ def draw_analysis_roi_on_frame(frame, analysis_rect, portafilter_ellipse=None, i
     return frame
 
 
+def draw_channeling_quadrants_overlay(frame, portafilter_ellipse=None, quadrant_counts=None):
+    # Draw quadrant split lines in ellipse-local space so replay clearly shows regional channeling.
+    if frame is None or portafilter_ellipse is None:
+        return frame
+
+    try:
+        (cx, cy), (width, height), angle_deg = portafilter_ellipse
+        a = float(width) * 0.5
+        b = float(height) * 0.5
+        theta = np.deg2rad(float(angle_deg))
+        cos_t = float(np.cos(theta))
+        sin_t = float(np.sin(theta))
+
+        major_a = (int(round(cx - a * cos_t)), int(round(cy - a * sin_t)))
+        major_b = (int(round(cx + a * cos_t)), int(round(cy + a * sin_t)))
+        minor_a = (int(round(cx + b * sin_t)), int(round(cy - b * cos_t)))
+        minor_b = (int(round(cx - b * sin_t)), int(round(cy + b * cos_t)))
+
+        cv2.line(frame, major_a, major_b, (200, 240, 90), 1, cv2.LINE_AA)
+        cv2.line(frame, minor_a, minor_b, (255, 190, 80), 1, cv2.LINE_AA)
+
+        def local_to_world(x_local, y_local):
+            x = float(cx) + float(x_local) * cos_t - float(y_local) * sin_t
+            y = float(cy) + float(x_local) * sin_t + float(y_local) * cos_t
+            return int(round(x)), int(round(y))
+
+        label_positions = {
+            "TL": local_to_world(-0.38 * a, -0.38 * b),
+            "TR": local_to_world(0.38 * a, -0.38 * b),
+            "BL": local_to_world(-0.38 * a, 0.38 * b),
+            "BR": local_to_world(0.38 * a, 0.38 * b),
+        }
+
+        if quadrant_counts is None:
+            quadrant_counts = {}
+        label_values = {
+            "TL": quadrant_counts.get("top_left"),
+            "TR": quadrant_counts.get("top_right"),
+            "BL": quadrant_counts.get("bottom_left"),
+            "BR": quadrant_counts.get("bottom_right"),
+        }
+
+        for label, pos in label_positions.items():
+            count_value = label_values.get(label)
+            if count_value is None:
+                text = label
+            else:
+                text = f"{label}:{int(count_value)}"
+            cv2.putText(
+                frame,
+                text,
+                pos,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (80, 240, 255),
+                1,
+                cv2.LINE_AA,
+            )
+    except Exception:
+        return frame
+
+    return frame
+
+
 def extract_colour_and_blonding(frames_bgr,
                                 frames_gray,
                                 start_frame,
@@ -1159,12 +1387,29 @@ def extract_colour_and_blonding(frames_bgr,
     saturation_curve = []
     hue_curve = []
     channeling_counts = []
+    channeling_confidence_curve = []
+    channeling_valid_curve = []
+    channel_lr_asymmetry_curve = []
+    channel_tb_asymmetry_curve = []
+    channel_spatial_entropy_curve = []
+    channel_left_density_curve = []
+    channel_right_density_curve = []
+    channel_top_density_curve = []
+    channel_bottom_density_curve = []
+    quadrant_count_curves = {
+        "top_left": [],
+        "top_right": [],
+        "bottom_left": [],
+        "bottom_right": [],
+    }
+    quadrant_density_curves = {
+        "top_left": [],
+        "top_right": [],
+        "bottom_left": [],
+        "bottom_right": [],
+    }
     channeling_frames = []
     stream_mask_frames = []
-    stream_width_curve = []
-    stream_straightness_curve = []
-    stream_center_offset_curve = []
-    stream_width_samples = []
 
     if analysis_roi is None and portafilter_ellipse is not None:
         analysis_roi = get_analysis_roi_from_ellipse(
@@ -1189,6 +1434,10 @@ def extract_colour_and_blonding(frames_bgr,
     )
     channel_roi_pixels = int(np.count_nonzero(channel_roi_mask)) if channel_roi_mask is not None else 0
     blond_roi_pixels = int(np.count_nonzero(blond_roi_mask)) if blond_roi_mask is not None else 0
+    _, quadrant_areas = make_channeling_quadrant_masks(
+        frame_shape,
+        portafilter_ellipse=portafilter_ellipse,
+    )
     stream_width_roi = get_stream_width_roi_from_ellipse(
         portafilter_ellipse,
         frames_bgr[0].shape,
@@ -1211,9 +1460,17 @@ def extract_colour_and_blonding(frames_bgr,
         vis_frame = curr_bgr.copy()
         hole_count = 0
         hole_keypoints = []
+        hole_meta = {
+            "detection_confidence": 0.0,
+            "raw_keypoints": 0,
+            "roi_filtered_keypoints": 0,
+            "final_keypoints": 0,
+            "size_match_ratio": 0.0,
+            "roi_area_px": channel_roi_pixels,
+        }
 
         if detect_channeling:
-            hole_count, hole_keypoints = detect_channeling_in_frame(
+            hole_count, hole_keypoints, hole_meta = detect_channeling_in_frame(
                 curr_gray,
                 portafilter_ellipse=portafilter_ellipse,
                 target_hole_size=target_hole_size,
@@ -1230,6 +1487,57 @@ def extract_colour_and_blonding(frames_bgr,
                 )
 
         channeling_counts.append(hole_count)
+        frame_conf = float(hole_meta.get("detection_confidence", 0.0))
+        channeling_confidence_curve.append(frame_conf)
+        channeling_valid_curve.append(1 if (frame_conf >= 0.25 and hole_count >= 0) else 0)
+
+        quadrant_counts = count_channeling_quadrants(
+            hole_keypoints,
+            portafilter_ellipse=portafilter_ellipse,
+        )
+        for key in quadrant_count_curves.keys():
+            q_count = int(quadrant_counts.get(key, 0))
+            quadrant_count_curves[key].append(q_count)
+            area_px = int(quadrant_areas.get(key, 0))
+            if area_px > 0:
+                quadrant_density_curves[key].append(float((q_count / area_px) * 1000.0))
+            else:
+                quadrant_density_curves[key].append(np.nan)
+
+        left_count = float(quadrant_counts["top_left"] + quadrant_counts["bottom_left"])
+        right_count = float(quadrant_counts["top_right"] + quadrant_counts["bottom_right"])
+        top_count = float(quadrant_counts["top_left"] + quadrant_counts["top_right"])
+        bottom_count = float(quadrant_counts["bottom_left"] + quadrant_counts["bottom_right"])
+        total_quadrant_count = left_count + right_count
+
+        if total_quadrant_count > 0:
+            lr_asym = (right_count - left_count) / max(1e-6, right_count + left_count)
+            tb_asym = (top_count - bottom_count) / max(1e-6, top_count + bottom_count)
+            spatial_entropy = _spatial_entropy_from_counts(quadrant_counts)
+        else:
+            lr_asym = np.nan
+            tb_asym = np.nan
+            spatial_entropy = np.nan
+
+        left_area = float(quadrant_areas["top_left"] + quadrant_areas["bottom_left"])
+        right_area = float(quadrant_areas["top_right"] + quadrant_areas["bottom_right"])
+        top_area = float(quadrant_areas["top_left"] + quadrant_areas["top_right"])
+        bottom_area = float(quadrant_areas["bottom_left"] + quadrant_areas["bottom_right"])
+
+        channel_lr_asymmetry_curve.append(float(lr_asym))
+        channel_tb_asymmetry_curve.append(float(tb_asym))
+        channel_spatial_entropy_curve.append(float(spatial_entropy))
+        channel_left_density_curve.append(float((left_count / left_area) * 1000.0) if left_area > 0 else np.nan)
+        channel_right_density_curve.append(float((right_count / right_area) * 1000.0) if right_area > 0 else np.nan)
+        channel_top_density_curve.append(float((top_count / top_area) * 1000.0) if top_area > 0 else np.nan)
+        channel_bottom_density_curve.append(float((bottom_count / bottom_area) * 1000.0) if bottom_area > 0 else np.nan)
+
+        draw_channeling_quadrants_overlay(
+            vis_frame,
+            portafilter_ellipse=portafilter_ellipse,
+            quadrant_counts=quadrant_counts,
+        )
+
         draw_analysis_roi_on_frame(
             vis_frame,
             analysis_roi,
@@ -1245,44 +1553,8 @@ def extract_colour_and_blonding(frames_bgr,
             stream_width_roi=stream_width_roi,
         )
 
-        width_measurement = detect_stream_width_in_roi(
-            curr_bgr,
-            curr_gray,
-            stream_mask,
-            stream_width_roi,
-        )
-        if width_measurement is None:
-            stream_width_curve.append(np.nan)
-            stream_straightness_curve.append(np.nan)
-            stream_center_offset_curve.append(np.nan)
-        else:
-            stream_width_curve.append(float(width_measurement["width_px"]))
-            stream_straightness_curve.append(float(width_measurement["straightness_score"]))
-            stream_center_offset_curve.append(float(width_measurement["center_offset_px"]))
-            stream_width_samples.append(
-                {
-                    "frame_index": int(t),
-                    "width_px": float(width_measurement["width_px"]),
-                    "measurement_row_y": int(width_measurement["measurement_row_y"]),
-                    "measurement_row_fraction": float(width_measurement["measurement_row_fraction"]),
-                    "straightness_score": float(width_measurement["straightness_score"]),
-                    "centeredness_score": float(width_measurement["centeredness_score"]),
-                    "center_offset_px": float(width_measurement["center_offset_px"]),
-                    "vertical_line_score": float(width_measurement["vertical_line_score"]),
-                    "edge_strength": float(width_measurement["edge_strength"]),
-                    "center_std": float(width_measurement["center_std"]),
-                    "center_slope": float(width_measurement["center_slope"]),
-                    "veer_direction": str(width_measurement.get("veer_direction", "center")),
-                    "veer_score": float(width_measurement.get("veer_score", 0.0)),
-                    "row_count": int(width_measurement["row_count"]),
-                }
-            )
-
-        draw_stream_width_overlay(
-            vis_frame,
-            width_roi=stream_width_roi,
-            width_measurement=width_measurement,
-        )
+        # Stream width and veer extraction are intentionally disabled.
+        width_measurement = None
 
         text = f"Holes: {hole_count}"
         text_font = cv2.FONT_HERSHEY_SIMPLEX
@@ -1294,6 +1566,30 @@ def extract_colour_and_blonding(frames_bgr,
         y = frame_h - 12 - text_baseline
         cv2.putText(vis_frame, text, (x, y), text_font, text_scale, (0, 0, 0), 4)
         cv2.putText(vis_frame, text, (x, y), text_font, text_scale, (0, 255, 0), text_thickness)
+
+        frame_rel_idx = int(t - (start_frame + 1))
+        shot_time_s = float(frame_rel_idx / max(1e-6, float(fps)))
+        shot_time_text = f"Shot t={shot_time_s:.2f}s | Frame {frame_rel_idx + 1}/{max(1, end_frame - start_frame)}"
+        cv2.putText(
+            vis_frame,
+            shot_time_text,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            vis_frame,
+            shot_time_text,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
         if capture_frames:
             channeling_frames.append(vis_frame.copy())
@@ -1310,9 +1606,35 @@ def extract_colour_and_blonding(frames_bgr,
             curr_bgr,
             analysis_rect=analysis_roi,
             portafilter_ellipse=portafilter_ellipse,
-            stream_width_roi=stream_width_roi,
+            stream_width_roi=None,
             stream_mask=stream_mask,
-            width_measurement=width_measurement,
+            width_measurement=None,
+        )
+
+        draw_channeling_quadrants_overlay(
+            mask_vis,
+            portafilter_ellipse=portafilter_ellipse,
+            quadrant_counts=quadrant_counts,
+        )
+        cv2.putText(
+            mask_vis,
+            shot_time_text,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            mask_vis,
+            shot_time_text,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
         )
 
         if capture_frames:
@@ -1384,17 +1706,70 @@ def extract_colour_and_blonding(frames_bgr,
 
     blond_frame = start_frame + 1 + blond_idx
 
-    best_stream_width = None
-    if stream_width_samples:
-        best_stream_width = min(
-            stream_width_samples,
-            key=lambda row: (
-                float(row["straightness_score"]),
-                float(row["centeredness_score"]),
-                float(row["center_std"]),
-                -int(row["row_count"]),
-            ),
-        )
+    channeling_counts_arr = np.array(channeling_counts, dtype=np.float32)
+    channeling_conf_arr = np.array(channeling_confidence_curve, dtype=np.float32)
+    lr_asym_arr = np.array(channel_lr_asymmetry_curve, dtype=np.float32)
+    tb_asym_arr = np.array(channel_tb_asymmetry_curve, dtype=np.float32)
+    entropy_arr = np.array(channel_spatial_entropy_curve, dtype=np.float32)
+
+    if channel_roi_pixels > 0:
+        channeling_norm_curve = (channeling_counts_arr / float(channel_roi_pixels)) * 1000.0
+    else:
+        channeling_norm_curve = channeling_counts_arr.copy()
+
+    quad_totals = {
+        key: int(np.nansum(np.array(values, dtype=np.float32)))
+        for key, values in quadrant_count_curves.items()
+    }
+    dominant_quadrant = max(quad_totals.items(), key=lambda item: item[1])[0] if quad_totals else None
+
+    total_left = float(quad_totals.get("top_left", 0) + quad_totals.get("bottom_left", 0))
+    total_right = float(quad_totals.get("top_right", 0) + quad_totals.get("bottom_right", 0))
+    total_top = float(quad_totals.get("top_left", 0) + quad_totals.get("top_right", 0))
+    total_bottom = float(quad_totals.get("bottom_left", 0) + quad_totals.get("bottom_right", 0))
+
+    if (total_left + total_right) > 0:
+        global_lr_asym = float((total_right - total_left) / (total_right + total_left))
+    else:
+        global_lr_asym = 0.0
+    if (total_top + total_bottom) > 0:
+        global_tb_asym = float((total_top - total_bottom) / (total_top + total_bottom))
+    else:
+        global_tb_asym = 0.0
+
+    finite_lr = lr_asym_arr[np.isfinite(lr_asym_arr)] if len(lr_asym_arr) > 0 else np.array([], dtype=np.float32)
+    finite_tb = tb_asym_arr[np.isfinite(tb_asym_arr)] if len(tb_asym_arr) > 0 else np.array([], dtype=np.float32)
+    finite_entropy = entropy_arr[np.isfinite(entropy_arr)] if len(entropy_arr) > 0 else np.array([], dtype=np.float32)
+
+    if len(channeling_counts_arr) >= 3:
+        split = max(1, len(channeling_counts_arr) // 3)
+        early_holes = float(np.nanmean(channeling_counts_arr[:split]))
+        late_holes = float(np.nanmean(channeling_counts_arr[-split:]))
+        early_late_hole_delta = float(late_holes - early_holes)
+    else:
+        early_holes = float(np.nanmean(channeling_counts_arr)) if len(channeling_counts_arr) > 0 else 0.0
+        late_holes = early_holes
+        early_late_hole_delta = 0.0
+
+    channel_peak = float(np.nanmax(channeling_counts_arr)) if len(channeling_counts_arr) > 0 else 0.0
+    channel_mean = float(np.nanmean(channeling_counts_arr)) if len(channeling_counts_arr) > 0 else 0.0
+    channel_std = float(np.nanstd(channeling_counts_arr)) if len(channeling_counts_arr) > 0 else 0.0
+    channel_burstiness = float(channel_peak / max(1e-6, channel_mean)) if channel_mean > 0 else 0.0
+
+    mean_confidence = float(np.nanmean(channeling_conf_arr)) if len(channeling_conf_arr) > 0 else 0.0
+    valid_detection_ratio = float(np.mean(channeling_valid_curve)) if channeling_valid_curve else 0.0
+
+    quality_flags = []
+    if mean_confidence < 0.35:
+        quality_flags.append("low_channel_detection_confidence")
+    if valid_detection_ratio < 0.60:
+        quality_flags.append("low_valid_channeling_frame_ratio")
+    if channel_peak <= 1.0:
+        quality_flags.append("very_sparse_channeling_signal")
+    if len(channeling_counts_arr) > 0 and float(np.nanmean(channeling_norm_curve)) < 1.0:
+        quality_flags.append("low_channeling_density")
+
+    quality_score = float(np.clip(0.55 * mean_confidence + 0.45 * valid_detection_ratio - 0.07 * len(quality_flags), 0.0, 1.0))
 
     # Keep this function non-blocking and GUI-safe by avoiding matplotlib output.
     # Plotting and saving files are now handled in the application layer.
@@ -1407,20 +1782,45 @@ def extract_colour_and_blonding(frames_bgr,
         "blond_frame": blond_frame,
         "blond_rate": float(blond_rate),
         "channeling_counts": channeling_counts,
+        "channeling_norm_curve": channeling_norm_curve,
+        "channel_detection_confidence_curve": channeling_confidence_curve,
+        "channel_valid_detection_curve": channeling_valid_curve,
+        "channel_quadrant_count_curves": quadrant_count_curves,
+        "channel_quadrant_density_curves": quadrant_density_curves,
+        "channel_lr_asymmetry_curve": channel_lr_asymmetry_curve,
+        "channel_tb_asymmetry_curve": channel_tb_asymmetry_curve,
+        "channel_spatial_entropy_curve": channel_spatial_entropy_curve,
+        "channel_left_density_curve": channel_left_density_curve,
+        "channel_right_density_curve": channel_right_density_curve,
+        "channel_top_density_curve": channel_top_density_curve,
+        "channel_bottom_density_curve": channel_bottom_density_curve,
+        "channeling_temporal_summary": {
+            "mean_holes": channel_mean,
+            "std_holes": channel_std,
+            "peak_holes": channel_peak,
+            "burstiness": channel_burstiness,
+            "early_holes_mean": early_holes,
+            "late_holes_mean": late_holes,
+            "early_late_holes_delta": early_late_hole_delta,
+        },
+        "channeling_spatial_summary": {
+            "quadrant_totals": quad_totals,
+            "quadrant_areas": quadrant_areas,
+            "dominant_quadrant": dominant_quadrant,
+            "global_left_right_asymmetry": global_lr_asym,
+            "global_top_bottom_asymmetry": global_tb_asym,
+            "mean_lr_asymmetry": float(np.mean(finite_lr)) if len(finite_lr) > 0 else 0.0,
+            "mean_tb_asymmetry": float(np.mean(finite_tb)) if len(finite_tb) > 0 else 0.0,
+            "mean_spatial_entropy": float(np.mean(finite_entropy)) if len(finite_entropy) > 0 else 0.0,
+        },
+        "channeling_quality": {
+            "quality_score": quality_score,
+            "mean_detection_confidence": mean_confidence,
+            "valid_detection_ratio": valid_detection_ratio,
+            "flags": quality_flags,
+        },
         "channeling_frames": channeling_frames if capture_frames else None,
         "stream_mask_frames": stream_mask_frames if capture_frames else None,
-        "stream_width_curve": np.array(stream_width_curve, dtype=float),
-        "stream_straightness_curve": np.array(stream_straightness_curve, dtype=float),
-        "stream_center_offset_curve": np.array(stream_center_offset_curve, dtype=float),
-        "stream_centeredness_curve": np.abs(np.array(stream_center_offset_curve, dtype=float)),
-        "stream_width_at_straightest_px": float(best_stream_width["width_px"]) if best_stream_width else None,
-        "stream_width_straightest_frame": int(best_stream_width["frame_index"]) if best_stream_width else None,
-        "stream_width_center_offset_px": float(best_stream_width["center_offset_px"]) if best_stream_width else None,
-        "stream_width_centeredness_score": float(best_stream_width["centeredness_score"]) if best_stream_width else None,
-        "stream_width_straightness_score": float(best_stream_width["straightness_score"]) if best_stream_width else None,
-        "stream_veer_direction": str(best_stream_width["veer_direction"]) if best_stream_width else None,
-        "stream_veer_score": float(best_stream_width["veer_score"]) if best_stream_width else None,
-        "stream_width_sample_rows": int(best_stream_width["row_count"]) if best_stream_width else None,
         "start_frame": start_frame,
         "end_frame": end_frame,
         "fps": fps,
@@ -1432,12 +1832,6 @@ def extract_colour_and_blonding(frames_bgr,
         },
         "channel_roi_pixels": channel_roi_pixels,
         "blond_roi_pixels": blond_roi_pixels,
-        "stream_width_roi": {
-            "x1": int(stream_width_roi[0]),
-            "y1": int(stream_width_roi[1]),
-            "x2": int(stream_width_roi[2]),
-            "y2": int(stream_width_roi[3]),
-        } if stream_width_roi is not None else None,
         "portafilter_ellipse": {
             "cx": float(portafilter_ellipse[0][0]),
             "cy": float(portafilter_ellipse[0][1]),
@@ -1477,7 +1871,7 @@ def extract_features_from_video(cropped_frames_dir=None,
     roi = (0, H, 0, W)
 
     print("Detecting flow start/end")
-    start_frame, end_frame = detect_flow_start_end(
+    start_frame, end_frame, flow_metrics = detect_flow_start_end(
         frames_gray=frames_gray,
         roi=roi,
         pixel_diff_thresh=15,           # Lower threshold for subtle changes
@@ -1494,6 +1888,10 @@ def extract_features_from_video(cropped_frames_dir=None,
     print(f"Shot duration (frames) : {end_frame - start_frame + 1}")
     print(f"Start frame file       : {frame_names[start_frame]}")
     print(f"End frame file         : {frame_names[end_frame]}")
+    print(f"Flow quality score     : {float(flow_metrics.get('quality_score', 0.0)):.2f}")
+    print(f"Flow confidence (S/E)  : {float(flow_metrics.get('start_confidence', 0.0)):.2f} / {float(flow_metrics.get('end_confidence', 0.0)):.2f}")
+    if flow_metrics.get("quality_flags"):
+        print(f"Flow quality flags     : {', '.join(flow_metrics['quality_flags'])}")
 
     # Detect portafilter for the cropped ROI context
     fast_params = portafilter_override_fast_params
@@ -1535,6 +1933,8 @@ def extract_features_from_video(cropped_frames_dir=None,
 
     print("\nBlonding And Channeling Results:")
     if colour_results:
+        colour_results["flow_detection"] = flow_metrics
+
         def to_json_curve(values):
             # Convert numpy-heavy arrays to plain JSON-safe lists.
             if values is None:
@@ -1553,11 +1953,6 @@ def extract_features_from_video(cropped_frames_dir=None,
 
         channeling_counts = to_json_curve(colour_results.get("channeling_counts"))
         valid_channeling = [v for v in channeling_counts if v is not None]
-        stream_width_curve = to_json_curve(colour_results.get("stream_width_curve"))
-        valid_stream_widths = [v for v in stream_width_curve if v is not None]
-        stream_center_offset_curve = to_json_curve(colour_results.get("stream_center_offset_curve"))
-        valid_stream_offsets = [v for v in stream_center_offset_curve if v is not None]
-
         for k, v in colour_results.items():
             if k == "channeling_counts":
                 if valid_channeling:
@@ -1568,36 +1963,25 @@ def extract_features_from_video(cropped_frames_dir=None,
                     print(f"  - Min visible holes: {np.min(channeling_array):.0f}")
                 else:
                     print("Channeling stats: no valid hole detections")
-            elif k == "stream_width_curve":
-                if valid_stream_widths:
-                    width_array = np.array(valid_stream_widths, dtype=float)
-                    print("Stream width stats (px):")
-                    print(f"  - Average width: {np.mean(width_array):.2f}")
-                    print(f"  - Max width: {np.max(width_array):.2f}")
-                    print(f"  - Min width: {np.min(width_array):.2f}")
-                    if colour_results.get("stream_width_at_straightest_px") is not None:
-                        print(
-                            "  - Straightest-frame width: "
-                            f"{float(colour_results['stream_width_at_straightest_px']):.2f} "
-                            f"(frame {int(colour_results['stream_width_straightest_frame'])})"
-                        )
-                    if colour_results.get("stream_width_center_offset_px") is not None:
-                        print(
-                            "  - Straightest-frame center offset: "
-                            f"{float(colour_results['stream_width_center_offset_px']):+.2f} px"
-                        )
-                else:
-                    print("Stream width stats: no valid edge detections")
             elif k not in [
                 "brightness_curve",
                 "saturation_curve",
                 "hue_curve",
                 "blond_score_curve",
+                "channeling_norm_curve",
                 "channeling_frames",
                 "stream_mask_frames",
-                "stream_straightness_curve",
-                "stream_center_offset_curve",
-                "stream_centeredness_curve",
+                "channel_detection_confidence_curve",
+                "channel_valid_detection_curve",
+                "channel_quadrant_count_curves",
+                "channel_quadrant_density_curves",
+                "channel_lr_asymmetry_curve",
+                "channel_tb_asymmetry_curve",
+                "channel_spatial_entropy_curve",
+                "channel_left_density_curve",
+                "channel_right_density_curve",
+                "channel_top_density_curve",
+                "channel_bottom_density_curve",
             ]:
                 print(f"{k}: {v}")
         
@@ -1610,10 +1994,10 @@ def extract_features_from_video(cropped_frames_dir=None,
             "flow_end": int(end_frame),
             "total_frames": len(frames_gray),
             "fps": float(colour_results.get("fps", 1.0) or 1.0),
+            "flow_detection": colour_results.get("flow_detection"),
             "analysis_roi": colour_results.get("analysis_roi"),
             "channel_roi_pixels": int(colour_results.get("channel_roi_pixels") or 0),
             "blond_roi_pixels": int(colour_results.get("blond_roi_pixels") or 0),
-            "stream_width_roi": colour_results.get("stream_width_roi"),
             "portafilter_ellipse": colour_results.get("portafilter_ellipse"),
             "target_hole_size": float(hole_mode_size) if hole_mode_size is not None else None,
             "brightness_curve": to_json_curve(colour_results.get("brightness_curve")),
@@ -1621,46 +2005,24 @@ def extract_features_from_video(cropped_frames_dir=None,
             "hue_curve": to_json_curve(colour_results.get("hue_curve")),
             "blond_score_curve": to_json_curve(colour_results.get("blond_score_curve")),
             "channeling_counts": channeling_counts,
-            "stream_width_curve": stream_width_curve,
-            "stream_straightness_curve": to_json_curve(colour_results.get("stream_straightness_curve")),
-            "stream_center_offset_curve": stream_center_offset_curve,
-            "stream_centeredness_curve": to_json_curve(colour_results.get("stream_centeredness_curve")),
-            "stream_width_at_straightest_px": (
-                float(colour_results["stream_width_at_straightest_px"])
-                if colour_results.get("stream_width_at_straightest_px") is not None
-                else None
-            ),
-            "stream_width_straightest_frame": (
-                int(colour_results["stream_width_straightest_frame"])
-                if colour_results.get("stream_width_straightest_frame") is not None
-                else None
-            ),
-            "stream_width_straightness_score": (
-                float(colour_results["stream_width_straightness_score"])
-                if colour_results.get("stream_width_straightness_score") is not None
-                else None
-            ),
-            "stream_veer_direction": colour_results.get("stream_veer_direction"),
-            "stream_veer_score": (
-                float(colour_results["stream_veer_score"])
-                if colour_results.get("stream_veer_score") is not None
-                else None
-            ),
-            "stream_width_center_offset_px": (
-                float(colour_results["stream_width_center_offset_px"])
-                if colour_results.get("stream_width_center_offset_px") is not None
-                else None
-            ),
-            "stream_width_centeredness_score": (
-                float(colour_results["stream_width_centeredness_score"])
-                if colour_results.get("stream_width_centeredness_score") is not None
-                else None
-            ),
-            "stream_width_sample_rows": (
-                int(colour_results["stream_width_sample_rows"])
-                if colour_results.get("stream_width_sample_rows") is not None
-                else None
-            ),
+            "channeling_norm_curve": to_json_curve(colour_results.get("channeling_norm_curve")),
+            "channel_detection_confidence_curve": to_json_curve(colour_results.get("channel_detection_confidence_curve")),
+            "channel_valid_detection_curve": colour_results.get("channel_valid_detection_curve") or [],
+            "channel_quadrant_count_curves": colour_results.get("channel_quadrant_count_curves") or {},
+            "channel_quadrant_density_curves": {
+                key: to_json_curve(values)
+                for key, values in (colour_results.get("channel_quadrant_density_curves") or {}).items()
+            },
+            "channel_lr_asymmetry_curve": to_json_curve(colour_results.get("channel_lr_asymmetry_curve")),
+            "channel_tb_asymmetry_curve": to_json_curve(colour_results.get("channel_tb_asymmetry_curve")),
+            "channel_spatial_entropy_curve": to_json_curve(colour_results.get("channel_spatial_entropy_curve")),
+            "channel_left_density_curve": to_json_curve(colour_results.get("channel_left_density_curve")),
+            "channel_right_density_curve": to_json_curve(colour_results.get("channel_right_density_curve")),
+            "channel_top_density_curve": to_json_curve(colour_results.get("channel_top_density_curve")),
+            "channel_bottom_density_curve": to_json_curve(colour_results.get("channel_bottom_density_curve")),
+            "channeling_temporal_summary": colour_results.get("channeling_temporal_summary"),
+            "channeling_spatial_summary": colour_results.get("channeling_spatial_summary"),
+            "channeling_quality": colour_results.get("channeling_quality"),
         }
         if valid_channeling:
             channeling_array = np.array(valid_channeling, dtype=float)
@@ -1669,20 +2031,26 @@ def extract_features_from_video(cropped_frames_dir=None,
                 "max": int(np.max(channeling_array)),
                 "min": int(np.min(channeling_array))
             }
-        if valid_stream_widths:
-            stream_width_array = np.array(valid_stream_widths, dtype=float)
-            results_json["stream_width_stats"] = {
-                "average": float(np.mean(stream_width_array)),
-                "max": float(np.max(stream_width_array)),
-                "min": float(np.min(stream_width_array)),
-            }
-        if valid_stream_offsets:
-            stream_offset_array = np.array(valid_stream_offsets, dtype=float)
-            results_json["stream_center_offset_stats"] = {
-                "average": float(np.mean(stream_offset_array)),
-                "max_right": float(np.max(stream_offset_array)),
-                "max_left": float(np.min(stream_offset_array)),
-            }
+
+        flow_quality = flow_metrics or {}
+        channel_quality = colour_results.get("channeling_quality") or {}
+        overall_flags = []
+        overall_flags.extend(flow_quality.get("quality_flags") or [])
+        overall_flags.extend(channel_quality.get("flags") or [])
+        overall_flags = sorted(set(overall_flags))
+        overall_score = float(np.clip(
+            0.5 * float(flow_quality.get("quality_score", 0.0))
+            + 0.5 * float(channel_quality.get("quality_score", 0.0)),
+            0.0,
+            1.0,
+        ))
+        results_json["quality"] = {
+            "overall_score": overall_score,
+            "flags": overall_flags,
+            "flow_score": float(flow_quality.get("quality_score", 0.0)),
+            "channeling_score": float(channel_quality.get("quality_score", 0.0)),
+        }
+        colour_results["quality"] = results_json["quality"]
         
         os.makedirs(output_results_dir, exist_ok=True)
         json_output_path = os.path.join(output_results_dir, f"{video_name}_results.json")

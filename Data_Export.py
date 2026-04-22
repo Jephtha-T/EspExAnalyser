@@ -183,6 +183,22 @@ def build_frame_rows(result, label):
     hue_curve = result.get("hue_curve") or []
     blond_score_curve = result.get("blond_score_curve") or []
     channeling_counts = result.get("channeling_counts") or []
+    channeling_norm_curve = result.get("channeling_norm_curve") or []
+    channel_conf_curve = result.get("channel_detection_confidence_curve") or []
+    channel_valid_curve = result.get("channel_valid_detection_curve") or []
+    quadrant_counts = result.get("channel_quadrant_count_curves") or {}
+    quadrant_density = result.get("channel_quadrant_density_curves") or {}
+    q_top_left = quadrant_counts.get("top_left") or []
+    q_top_right = quadrant_counts.get("top_right") or []
+    q_bottom_left = quadrant_counts.get("bottom_left") or []
+    q_bottom_right = quadrant_counts.get("bottom_right") or []
+    qd_top_left = quadrant_density.get("top_left") or []
+    qd_top_right = quadrant_density.get("top_right") or []
+    qd_bottom_left = quadrant_density.get("bottom_left") or []
+    qd_bottom_right = quadrant_density.get("bottom_right") or []
+    channel_lr_asym_curve = result.get("channel_lr_asymmetry_curve") or []
+    channel_tb_asym_curve = result.get("channel_tb_asymmetry_curve") or []
+    channel_entropy_curve = result.get("channel_spatial_entropy_curve") or []
 
     frame_count = _get_frame_count(result)
     if frame_count == 0:
@@ -207,6 +223,20 @@ def build_frame_rows(result, label):
         hue = _value_at(hue_curve, index)
         blond_score = _value_at(blond_scores, index)
         holes = _value_at(channeling_counts, index)
+        holes_norm_curve_value = _value_at(channeling_norm_curve, index)
+        channel_confidence = _value_at(channel_conf_curve, index)
+        valid_detection = _value_at(channel_valid_curve, index)
+        q_tl = _value_at(q_top_left, index)
+        q_tr = _value_at(q_top_right, index)
+        q_bl = _value_at(q_bottom_left, index)
+        q_br = _value_at(q_bottom_right, index)
+        qd_tl = _value_at(qd_top_left, index)
+        qd_tr = _value_at(qd_top_right, index)
+        qd_bl = _value_at(qd_bottom_left, index)
+        qd_br = _value_at(qd_bottom_right, index)
+        lr_asym = _value_at(channel_lr_asym_curve, index)
+        tb_asym = _value_at(channel_tb_asym_curve, index)
+        spatial_entropy = _value_at(channel_entropy_curve, index)
 
         # Hole normalization is density-like: holes per 1000 ROI pixels.
         if holes is None:
@@ -242,6 +272,20 @@ def build_frame_rows(result, label):
                 "blond_score": blond_score,
                 "channel_holes": holes,
                 "channel_holes_norm": holes_norm,
+                "channel_holes_norm_curve": holes_norm_curve_value,
+                "channel_detection_confidence": channel_confidence,
+                "channel_valid_detection": int(valid_detection) if valid_detection is not None else None,
+                "channel_q_top_left": q_tl,
+                "channel_q_top_right": q_tr,
+                "channel_q_bottom_left": q_bl,
+                "channel_q_bottom_right": q_br,
+                "channel_qd_top_left": qd_tl,
+                "channel_qd_top_right": qd_tr,
+                "channel_qd_bottom_left": qd_bl,
+                "channel_qd_bottom_right": qd_br,
+                "channel_lr_asymmetry": lr_asym,
+                "channel_tb_asymmetry": tb_asym,
+                "channel_spatial_entropy": spatial_entropy,
                 "is_valid_frame": 1 if (brightness is not None or holes is not None) else 0,
             }
         )
@@ -265,6 +309,11 @@ def build_event_row(result, label, frame_rows):
     flow_start = _as_int(result.get("flow_start"), 0)
     flow_end = _as_int(result.get("flow_end"), flow_start)
     shot_time_s = max(0.0, (flow_end - flow_start + 1) / fps)
+    flow_detection = result.get("flow_detection") or {}
+    channeling_quality = result.get("channeling_quality") or {}
+    channeling_spatial_summary = result.get("channeling_spatial_summary") or {}
+    channeling_temporal_summary = result.get("channeling_temporal_summary") or {}
+    quality = result.get("quality") or {}
 
     event_row = {
         "video_id": video_id,
@@ -275,6 +324,21 @@ def build_event_row(result, label, frame_rows):
         "flow_end": flow_end,
         "blond_frame": result.get("blond_frame"),
         "blond_rate": _as_float(result.get("blond_rate")),
+        "flow_start_confidence": _as_float(flow_detection.get("start_confidence")),
+        "flow_end_confidence": _as_float(flow_detection.get("end_confidence")),
+        "flow_quality_score": _as_float(flow_detection.get("quality_score")),
+        "channel_quality_score": _as_float(channeling_quality.get("quality_score")),
+        "channel_mean_confidence": _as_float(channeling_quality.get("mean_detection_confidence")),
+        "channel_valid_ratio": _as_float(channeling_quality.get("valid_detection_ratio")),
+        "overall_quality_score": _as_float(quality.get("overall_score")),
+        "channel_global_lr_asymmetry": _as_float(channeling_spatial_summary.get("global_left_right_asymmetry")),
+        "channel_global_tb_asymmetry": _as_float(channeling_spatial_summary.get("global_top_bottom_asymmetry")),
+        "channel_mean_lr_asymmetry": _as_float(channeling_spatial_summary.get("mean_lr_asymmetry")),
+        "channel_mean_tb_asymmetry": _as_float(channeling_spatial_summary.get("mean_tb_asymmetry")),
+        "channel_mean_spatial_entropy": _as_float(channeling_spatial_summary.get("mean_spatial_entropy")),
+        "channel_peak_holes": _as_float(channeling_temporal_summary.get("peak_holes")),
+        "channel_burstiness": _as_float(channeling_temporal_summary.get("burstiness")),
+        "channel_early_late_holes_delta": _as_float(channeling_temporal_summary.get("early_late_holes_delta")),
     }
 
     for threshold in (0.2, 0.4, 0.6, 0.8):
@@ -368,6 +432,12 @@ def export_to_csv(analysis_dir, output_file="training_data.csv"):
                 "channeling_avg": _as_float(channel_stats.get("average")) or 0.0,
                 "channeling_max": _as_float(channel_stats.get("max")) or 0.0,
                 "channeling_min": _as_float(channel_stats.get("min")) or 0.0,
+                "flow_quality_score": _as_float(event_row.get("flow_quality_score")) or 0.0,
+                "channel_quality_score": _as_float(event_row.get("channel_quality_score")) or 0.0,
+                "overall_quality_score": _as_float(event_row.get("overall_quality_score")) or 0.0,
+                "channel_global_lr_asymmetry": _as_float(event_row.get("channel_global_lr_asymmetry")) or 0.0,
+                "channel_global_tb_asymmetry": _as_float(event_row.get("channel_global_tb_asymmetry")) or 0.0,
+                "channel_mean_spatial_entropy": _as_float(event_row.get("channel_mean_spatial_entropy")) or 0.0,
             }
         )
 
@@ -407,6 +477,12 @@ def export_to_csv(analysis_dir, output_file="training_data.csv"):
             "channel_peak_s": event_row.get("channel_peak_s"),
             "channel_peak_value": event_row.get("channel_peak_value"),
             "channel_recovery_s": event_row.get("channel_recovery_s"),
+            "flow_quality_score": shot_row["flow_quality_score"],
+            "channel_quality_score": shot_row["channel_quality_score"],
+            "overall_quality_score": shot_row["overall_quality_score"],
+            "channel_global_lr_asymmetry": shot_row["channel_global_lr_asymmetry"],
+            "channel_global_tb_asymmetry": shot_row["channel_global_tb_asymmetry"],
+            "channel_mean_spatial_entropy": shot_row["channel_mean_spatial_entropy"],
         }
         summary_rows.append(merged_row)
 
@@ -436,6 +512,20 @@ def export_to_csv(analysis_dir, output_file="training_data.csv"):
         "blond_score",
         "channel_holes",
         "channel_holes_norm",
+        "channel_holes_norm_curve",
+        "channel_detection_confidence",
+        "channel_valid_detection",
+        "channel_q_top_left",
+        "channel_q_top_right",
+        "channel_q_bottom_left",
+        "channel_q_bottom_right",
+        "channel_qd_top_left",
+        "channel_qd_top_right",
+        "channel_qd_bottom_left",
+        "channel_qd_bottom_right",
+        "channel_lr_asymmetry",
+        "channel_tb_asymmetry",
+        "channel_spatial_entropy",
         "is_valid_frame",
     ]
 
@@ -448,6 +538,21 @@ def export_to_csv(analysis_dir, output_file="training_data.csv"):
         "flow_end",
         "blond_frame",
         "blond_rate",
+        "flow_start_confidence",
+        "flow_end_confidence",
+        "flow_quality_score",
+        "channel_quality_score",
+        "channel_mean_confidence",
+        "channel_valid_ratio",
+        "overall_quality_score",
+        "channel_global_lr_asymmetry",
+        "channel_global_tb_asymmetry",
+        "channel_mean_lr_asymmetry",
+        "channel_mean_tb_asymmetry",
+        "channel_mean_spatial_entropy",
+        "channel_peak_holes",
+        "channel_burstiness",
+        "channel_early_late_holes_delta",
         "t_blond_20_s",
         "t_blond_20_norm",
         "f_blond_20",
@@ -493,6 +598,12 @@ def export_to_csv(analysis_dir, output_file="training_data.csv"):
         "channel_peak_s",
         "channel_peak_value",
         "channel_recovery_s",
+        "flow_quality_score",
+        "channel_quality_score",
+        "overall_quality_score",
+        "channel_global_lr_asymmetry",
+        "channel_global_tb_asymmetry",
+        "channel_mean_spatial_entropy",
     ]
 
     try:

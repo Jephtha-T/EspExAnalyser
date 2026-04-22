@@ -113,6 +113,10 @@ class EspressoAnalysisApp:
         self._anim_index = 0
         self._anim_label = None
         self._stream_mask_label = None
+        self._anim_meta_label = None
+        self._replay_fps = 1.0
+        self._replay_start_frame = 0
+        self._replay_total_frames = 0
 
         self.channeling_overlay_ref = None
         self.stream_mask_overlay_ref = None
@@ -811,43 +815,28 @@ class EspressoAnalysisApp:
         fps = feature_results.get("fps", 1.0) or 1.0
         shot_seconds = 0 if end_frame < start_frame else (end_frame - start_frame + 1) / fps
         channeling = feature_results.get("channeling_counts") or []
-        stream_width_curve = feature_results.get("stream_width_curve")
-        if stream_width_curve is None:
-            stream_width_curve = []
-        stream_center_offset_curve = feature_results.get("stream_center_offset_curve")
-        if stream_center_offset_curve is None:
-            stream_center_offset_curve = []
-        stream_width_px = feature_results.get("stream_width_at_straightest_px")
-        stream_width_frame = feature_results.get("stream_width_straightest_frame")
-        stream_center_offset_px = feature_results.get("stream_width_center_offset_px")
-        stream_veer_direction = feature_results.get("stream_veer_direction")
-        stream_veer_score = feature_results.get("stream_veer_score")
+        spatial_summary = feature_results.get("channeling_spatial_summary") or {}
+        channel_quality = feature_results.get("channeling_quality") or {}
+        overall_quality = feature_results.get("quality") or {}
 
         ttk.Label(info, text=f"Video: {video_name}", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         ttk.Label(info, text=f"Blonding frame: {blond_frame}").pack(anchor="w")
-        if stream_width_px is not None and stream_width_frame is not None:
+        if spatial_summary.get("dominant_quadrant"):
+            ttk.Label(info, text=f"Dominant channeling quadrant: {spatial_summary['dominant_quadrant']}").pack(anchor="w")
+        if spatial_summary.get("global_left_right_asymmetry") is not None:
             ttk.Label(
                 info,
-                text=f"Straightest stream width: {float(stream_width_px):.2f} px (frame {int(stream_width_frame)})",
+                text=f"Global left/right asymmetry: {float(spatial_summary.get('global_left_right_asymmetry', 0.0)):+.2f}",
             ).pack(anchor="w")
-        elif stream_width_px is not None:
-            ttk.Label(info, text=f"Straightest stream width: {float(stream_width_px):.2f} px").pack(anchor="w")
-        if stream_center_offset_px is not None:
-            ttk.Label(
-                info,
-                text=f"Straightest-frame veer offset: {float(stream_center_offset_px):+.2f} px",
-            ).pack(anchor="w")
-        if stream_veer_direction:
-            veer_text = f"Detected veer: {stream_veer_direction}"
-            if stream_veer_score is not None:
-                veer_text += f" ({float(stream_veer_score):.2f})"
-            ttk.Label(info, text=veer_text).pack(anchor="w")
+        if overall_quality.get("overall_score") is not None:
+            ttk.Label(info, text=f"Overall quality score: {float(overall_quality.get('overall_score', 0.0)):.2f}").pack(anchor="w")
+        quality_flags = overall_quality.get("flags") or channel_quality.get("flags") or []
+        if quality_flags:
+            ttk.Label(info, text=f"Quality flags: {', '.join(quality_flags)}", wraplength=620).pack(anchor="w")
 
         fig = Figure(figsize=(7.3, 10.2), dpi=100)
-        ax_top = fig.add_subplot(4, 1, 1)
-        ax_mid = fig.add_subplot(4, 1, 2)
-        ax_low = fig.add_subplot(4, 1, 3)
-        ax_bottom = fig.add_subplot(4, 1, 4)
+        ax_top = fig.add_subplot(2, 1, 1)
+        ax_mid = fig.add_subplot(2, 1, 2)
 
         brightness = np.array(feature_results.get("brightness_curve"), dtype=float)
         saturation = np.array(feature_results.get("saturation_curve"), dtype=float)
@@ -878,6 +867,14 @@ class EspressoAnalysisApp:
             times = np.arange(len(channeling)) / fps
             channeling_arr = np.array(channeling)
             ax_mid.plot(times, channeling_arr, color="red", linewidth=2, label="Visible holes")
+
+            left_density_curve = np.array(feature_results.get("channel_left_density_curve") or [], dtype=float)
+            right_density_curve = np.array(feature_results.get("channel_right_density_curve") or [], dtype=float)
+            if len(left_density_curve) == len(channeling_arr) and np.any(~np.isnan(left_density_curve)):
+                ax_mid.plot(times, left_density_curve, color="#00509d", linewidth=1.2, alpha=0.8, label="Left density")
+            if len(right_density_curve) == len(channeling_arr) and np.any(~np.isnan(right_density_curve)):
+                ax_mid.plot(times, right_density_curve, color="#f77f00", linewidth=1.2, alpha=0.8, label="Right density")
+
             ax_mid.set_title("Channeling count per frame")
             ax_mid.set_xlabel("Time (s)")
             ax_mid.set_ylabel("Hole count")
@@ -886,44 +883,6 @@ class EspressoAnalysisApp:
             ax_mid.legend(loc="best")
         else:
             ax_mid.text(0.5, 0.5, "No channeling data", ha="center", va="center")
-
-        stream_width_arr = np.array(stream_width_curve, dtype=float)
-        valid_stream = ~np.isnan(stream_width_arr) if stream_width_arr.size > 0 else np.array([], dtype=bool)
-        if stream_width_arr.size > 0 and np.any(valid_stream):
-            width_times = np.arange(len(stream_width_arr)) / fps
-            ax_low.plot(width_times, stream_width_arr, color="blue", linewidth=2, label="Stream width")
-            if stream_width_frame is not None:
-                straightest_x = (int(stream_width_frame) - (start_frame + 1)) / fps
-                ax_low.axvline(
-                    x=straightest_x,
-                    color="navy",
-                    linestyle="--",
-                    label="Straightest point",
-                )
-            ax_low.set_title("Stream width over time")
-            ax_low.set_xlabel("Time (s)")
-            ax_low.set_ylabel("Width (px)")
-            ax_low.grid(alpha=0.3)
-            ax_low.legend(loc="best")
-        else:
-            ax_low.text(0.5, 0.5, "No stream-width data", ha="center", va="center")
-
-        stream_center_arr = np.array(stream_center_offset_curve, dtype=float)
-        valid_center = ~np.isnan(stream_center_arr) if stream_center_arr.size > 0 else np.array([], dtype=bool)
-        if stream_center_arr.size > 0 and np.any(valid_center):
-            center_times = np.arange(len(stream_center_arr)) / fps
-            ax_bottom.plot(center_times, stream_center_arr, color="#1f77b4", linewidth=2, label="Center offset")
-            ax_bottom.axhline(y=0.0, color="black", linestyle="--", linewidth=1, label="Centered")
-            if stream_width_frame is not None:
-                straightest_x = (int(stream_width_frame) - (start_frame + 1)) / fps
-                ax_bottom.axvline(x=straightest_x, color="navy", linestyle=":", linewidth=1)
-            ax_bottom.set_title("Stream left/right veer (+right, -left)")
-            ax_bottom.set_xlabel("Time (s)")
-            ax_bottom.set_ylabel("Offset (px)")
-            ax_bottom.grid(alpha=0.3)
-            ax_bottom.legend(loc="best")
-        else:
-            ax_bottom.text(0.5, 0.5, "No stream-center data", ha="center", va="center")
 
         fig.tight_layout(pad=2.6)
         self.figure = fig
@@ -942,11 +901,20 @@ class EspressoAnalysisApp:
         self._channeling_frames = feature_results.get("channeling_frames") or []
         self._stream_mask_frames = feature_results.get("stream_mask_frames") or []
         self._anim_index = 0
+        self._replay_fps = float(fps)
+        self._replay_start_frame = int(start_frame)
+        self._replay_total_frames = max(len(self._channeling_frames), len(self._stream_mask_frames))
 
         self._anim_label = ttk.Label(vis_frame)
         self._anim_label.pack(padx=12, pady=12)
         self._stream_mask_label = ttk.Label(mask_frame)
         self._stream_mask_label.pack(padx=12, pady=12)
+        self._anim_meta_label = ttk.Label(
+            vis_frame,
+            text="",
+            font=("Segoe UI", 10),
+        )
+        self._anim_meta_label.pack(anchor="center", pady=(0, 6))
         ttk.Button(
             vis_frame,
             text="Export Results CSV",
@@ -969,19 +937,6 @@ class EspressoAnalysisApp:
         self.status_var.set("Analysis complete")
         self._append_log(f"Tracking frames: {tracking_result.get('frame_count')}")
         self._append_log(f"Blonding frame: {blond_frame}")
-        if stream_width_px is not None and stream_width_frame is not None:
-            self._append_log(
-                f"Straightest stream width: {float(stream_width_px):.2f} px at frame {int(stream_width_frame)}"
-            )
-        elif stream_width_px is not None:
-            self._append_log(f"Straightest stream width: {float(stream_width_px):.2f} px")
-        if stream_center_offset_px is not None:
-            self._append_log(f"Straightest-frame center offset: {float(stream_center_offset_px):+.2f} px")
-        if stream_veer_direction:
-            if stream_veer_score is not None:
-                self._append_log(f"Detected veer: {stream_veer_direction} ({float(stream_veer_score):.2f})")
-            else:
-                self._append_log(f"Detected veer: {stream_veer_direction}")
         if self._channeling_frames or self._stream_mask_frames:
             self._animate_channeling_frame()
 
@@ -1001,6 +956,14 @@ class EspressoAnalysisApp:
 
         frame_index = self._anim_index % max_len
         self._anim_index = (self._anim_index + 1) % max_len
+
+        if self._anim_meta_label is not None:
+            rel_frame = frame_index + 1
+            shot_t = (frame_index / max(1e-6, float(self._replay_fps)))
+            abs_frame = self._replay_start_frame + 1 + frame_index
+            self._anim_meta_label.configure(
+                text=f"Replay frame {rel_frame}/{max_len} | Shot t={shot_t:.2f}s | Abs frame {abs_frame}"
+            )
 
         if self._channeling_frames and self._anim_label is not None:
             frame = self._channeling_frames[frame_index % len(self._channeling_frames)]
