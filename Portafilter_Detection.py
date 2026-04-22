@@ -1,5 +1,9 @@
 import cv2
 import os
+import sys
+import json
+import tempfile
+import subprocess
 import numpy as np
 from PIL import Image, ExifTags
 import matplotlib.pyplot as plt
@@ -9,6 +13,261 @@ import matplotlib.patches as mpatches
 
 Base_Dir = os.path.dirname(os.path.abspath(__file__))
 Frame_Dir = os.path.join(Base_Dir, "Image Data/Frames")
+_YOLO_MODEL_CACHE = {"path": None, "model": None, "load_error": None}
+
+
+def _resolve_portafilter_model_path(model_path=None):
+    if model_path:
+        if os.path.isfile(model_path):
+            return model_path
+        return None
+
+    candidates = [
+        os.path.join(Base_Dir, "portafilter_latest.pt"),
+        os.path.join(Base_Dir, "yolo_portafilter", "models", "portafilter_latest.pt"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _load_portafilter_yolo_model(model_path=None):
+    resolved = _resolve_portafilter_model_path(model_path)
+    if resolved is None:
+        return None, "YOLO model file not found"
+
+    cached_path = _YOLO_MODEL_CACHE.get("path")
+    cached_model = _YOLO_MODEL_CACHE.get("model")
+    if cached_model is not None and cached_path == resolved:
+        return cached_model, None
+
+    try:
+        from ultralytics import YOLO
+
+        model = YOLO(resolved)
+        _YOLO_MODEL_CACHE["path"] = resolved
+        _YOLO_MODEL_CACHE["model"] = model
+        _YOLO_MODEL_CACHE["load_error"] = None
+        return model, None
+    except Exception as exc:
+        _YOLO_MODEL_CACHE["path"] = resolved
+        _YOLO_MODEL_CACHE["model"] = None
+        _YOLO_MODEL_CACHE["load_error"] = str(exc)
+        return None, str(exc)
+
+
+def _detect_portafilter_bbox_yolo_subprocess(image, resolved_model_path, conf=0.25, iou=0.45):
+    if image is None or image.size == 0:
+        return None, None, "empty image"
+    if resolved_model_path is None or not os.path.isfile(resolved_model_path):
+        return None, None, "model file missing"
+
+    helper_code = (
+        "import sys, json, cv2\n"
+        "from ultralytics import YOLO\n"
+        "img_path, model_path, conf_s, iou_s = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]\n"
+        "conf = float(conf_s)\n"
+        "iou = float(iou_s)\n"
+        "img = cv2.imread(img_path)\n"
+        "if img is None:\n"
+        "    print(json.dumps({'xyxy': None, 'conf': None, 'error': 'failed to read temp image'}))\n"
+        "    sys.exit(0)\n"
+        "model = YOLO(model_path)\n"
+        "results = model.predict(source=img, conf=conf, iou=iou, verbose=False)\n"
+        "if not results:\n"
+        "    print(json.dumps({'xyxy': None, 'conf': None, 'error': 'no results'}))\n"
+        "    sys.exit(0)\n"
+        "boxes = getattr(results[0], 'boxes', None)\n"
+        "if boxes is None or len(boxes) == 0:\n"
+        "    print(json.dumps({'xyxy': None, 'conf': None, 'error': 'no boxes'}))\n"
+        "    sys.exit(0)\n"
+        "confs = boxes.conf.cpu().numpy().tolist()\n"
+        "best_index = max(range(len(confs)), key=lambda idx: float(confs[idx]))\n"
+        "xyxy = boxes.xyxy[best_index].cpu().numpy().tolist()\n"
+        "best_conf = float(confs[best_index])\n"
+        "print(json.dumps({'xyxy': xyxy, 'conf': best_conf, 'error': None}))\n"
+    )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="yolo_bbox_") as temp_dir:
+            temp_image_path = os.path.join(temp_dir, "frame.jpg")
+            if not cv2.imwrite(temp_image_path, image):
+                return None, None, "failed to write temp image"
+
+            cmd = [
+                sys.executable,
+                "-c",
+                helper_code,
+                temp_image_path,
+                resolved_model_path,
+                str(float(conf)),
+                str(float(iou)),
+            ]
+            completed = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+    except Exception as exc:
+        return None, None, str(exc)
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "subprocess failed").strip()
+        return None, None, detail
+
+    raw_lines = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+    for line in reversed(raw_lines):
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+
+        xyxy = payload.get("xyxy")
+        conf_score = payload.get("conf")
+        if isinstance(xyxy, list) and len(xyxy) == 4 and conf_score is not None:
+            return xyxy, float(conf_score), None
+        error = payload.get("error")
+        if error:
+            return None, None, str(error)
+
+    detail = (completed.stdout or completed.stderr or "no JSON result").strip()
+    return None, None, detail
+
+
+def detect_portafilter_bbox_yolo(
+    image,
+    model_path=None,
+    conf=0.25,
+    iou=0.45,
+    padding_ratio=0.12,
+):
+    if image is None or image.size == 0:
+        return None, None
+
+    resolved = _resolve_portafilter_model_path(model_path)
+    if resolved is None:
+        return None, None
+
+    xyxy = None
+    best_conf = None
+
+    model, load_error = _load_portafilter_yolo_model(model_path=resolved)
+    if model is None:
+        if load_error:
+            print(f"YOLO preload skipped: {load_error}")
+        xyxy, best_conf, sub_err = _detect_portafilter_bbox_yolo_subprocess(
+            image,
+            resolved_model_path=resolved,
+            conf=conf,
+            iou=iou,
+        )
+        if xyxy is None:
+            if sub_err:
+                print(f"YOLO subprocess fallback failed: {sub_err}")
+            return None, None
+        print("YOLO subprocess fallback succeeded.")
+    else:
+        try:
+            results = model.predict(source=image, conf=float(conf), iou=float(iou), verbose=False)
+        except Exception as exc:
+            print(f"YOLO predict failed: {exc}")
+            xyxy, best_conf, sub_err = _detect_portafilter_bbox_yolo_subprocess(
+                image,
+                resolved_model_path=resolved,
+                conf=conf,
+                iou=iou,
+            )
+            if xyxy is None:
+                if sub_err:
+                    print(f"YOLO subprocess fallback failed: {sub_err}")
+                return None, None
+            print("YOLO subprocess fallback succeeded.")
+            results = None
+
+        if xyxy is None:
+            if not results:
+                return None, None
+
+            result = results[0]
+            boxes = getattr(result, "boxes", None)
+            if boxes is None or len(boxes) == 0:
+                return None, None
+
+            best_index = None
+            best_conf = -1.0
+            try:
+                confs = boxes.conf.cpu().numpy().tolist()
+            except Exception:
+                confs = []
+
+            for index, score in enumerate(confs):
+                score = float(score)
+                if score > best_conf:
+                    best_conf = score
+                    best_index = index
+
+            if best_index is None:
+                return None, None
+
+            try:
+                xyxy = boxes.xyxy[best_index].cpu().numpy().tolist()
+            except Exception:
+                return None, None
+
+    if len(xyxy) != 4:
+        return None, None
+
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in xyxy]
+    box_w = max(1.0, x2 - x1)
+    box_h = max(1.0, y2 - y1)
+    pad_x = box_w * float(padding_ratio)
+    pad_y = box_h * float(padding_ratio)
+
+    x1 = max(0, int(np.floor(x1 - pad_x)))
+    y1 = max(0, int(np.floor(y1 - pad_y)))
+    x2 = min(w, int(np.ceil(x2 + pad_x)))
+    y2 = min(h, int(np.ceil(y2 + pad_y)))
+
+    if x2 - x1 < 10 or y2 - y1 < 10:
+        return None, None
+
+    return (x1, y1, x2, y2), float(best_conf)
+
+
+def _offset_ellipse(ellipse, offset):
+    if ellipse is None:
+        return None
+
+    ox, oy = offset
+    (cx, cy), axes, angle = ellipse
+    return ((cx + ox, cy + oy), axes, angle)
+
+
+def _ellipse_from_roi_bounds(image_shape, pad_ratio_x=0.08, pad_ratio_y=0.10):
+    if image_shape is None or len(image_shape) < 2:
+        return None
+
+    h, w = int(image_shape[0]), int(image_shape[1])
+    if h <= 2 or w <= 2:
+        return None
+
+    pad_x = max(2, int(round(w * float(pad_ratio_x))))
+    pad_y = max(2, int(round(h * float(pad_ratio_y))))
+
+    left = min(max(0, pad_x), max(0, w - 2))
+    right = max(left + 2, min(w, w - pad_x))
+    top = min(max(0, pad_y), max(0, h - 2))
+    bottom = max(top + 2, min(h, h - pad_y))
+
+    major = float(max(10, right - left))
+    minor = float(max(10, bottom - top))
+    angle = 90.0 if minor >= major else 0.0
+
+    return _normalize_ellipse(((w / 2.0, h / 2.0), (major, minor), angle))
 
 
 def find_mode_size(keypoint_sizes, tolerance=5):
@@ -307,6 +566,85 @@ def safe_draw_ellipse(img, ellipse, color, thickness=1):
     cv2.ellipse(img, ellipse, color, thickness)
 
 
+def _is_similar_ellipse(e1, e2, center_tol=10.0, axis_tol=12.0, angle_tol=14.0):
+    if e1 is None or e2 is None:
+        return False
+
+    (c1x, c1y), (a1x, a1y), ang1 = e1
+    (c2x, c2y), (a2x, a2y), ang2 = e2
+
+    center_dist = np.hypot(float(c1x) - float(c2x), float(c1y) - float(c2y))
+    if center_dist > float(center_tol):
+        return False
+
+    axes_1 = sorted([float(a1x), float(a1y)])
+    axes_2 = sorted([float(a2x), float(a2y)])
+    if abs(axes_1[0] - axes_2[0]) > float(axis_tol) or abs(axes_1[1] - axes_2[1]) > float(axis_tol):
+        return False
+
+    delta_angle = abs(float(ang1) - float(ang2)) % 180.0
+    delta_angle = min(delta_angle, 180.0 - delta_angle)
+    return delta_angle <= float(angle_tol)
+
+
+def _append_unique_ellipse(ellipses, areas, ellipse, area):
+    for existing in ellipses:
+        if _is_similar_ellipse(existing, ellipse):
+            return False
+    ellipses.append(ellipse)
+    areas.append(float(area))
+    return True
+
+
+def _extract_ellipse_candidates_from_binary(
+    binary_image,
+    min_area,
+    min_axis,
+    max_aspect=8.0,
+    retrieval_modes=(cv2.RETR_LIST, cv2.RETR_EXTERNAL),
+):
+    if binary_image is None or binary_image.size == 0:
+        return [], []
+
+    candidates = []
+    candidate_areas = []
+
+    for retrieval_mode in retrieval_modes:
+        try:
+            contours, _ = cv2.findContours(binary_image, retrieval_mode, cv2.CHAIN_APPROX_SIMPLE)
+        except Exception:
+            continue
+
+        for cnt in contours:
+            if cnt is None or len(cnt) < 5:
+                continue
+
+            try:
+                ellipse = cv2.fitEllipse(cnt)
+            except Exception:
+                continue
+
+            x_len, y_len = ellipse[1]
+            if not (np.isfinite(x_len) and np.isfinite(y_len)):
+                continue
+            if x_len <= 0 or y_len <= 0:
+                continue
+            if min(x_len, y_len) < float(min_axis):
+                continue
+
+            aspect_ratio = max(x_len, y_len) / max(1e-6, min(x_len, y_len))
+            if aspect_ratio > float(max_aspect):
+                continue
+
+            area = float(x_len * y_len * np.pi)
+            if area < float(min_area):
+                continue
+
+            _append_unique_ellipse(candidates, candidate_areas, ellipse, area)
+
+    return candidates, candidate_areas
+
+
 def count_keypoints_in_ellipse(ellipse, keypoints, image_shape):
     if ellipse is None or keypoints is None or len(keypoints) == 0:
         return 0
@@ -586,26 +924,23 @@ def detect_elliptical_portafilter_with_holes(
     mask_threshold=30,
     manual_roi=False,
     manual_ellipse=None,
+    use_yolo_prefilter=True,
+    yolo_model_path=None,
+    yolo_conf=0.25,
+    yolo_iou=0.45,
+    yolo_padding_ratio=0.12,
     return_debug=False,
 ):
     if image is None:
         print(f"Error loading image: {image}")
         return None
     
+    original_image = image.copy()
+
     # Dictionary to store all intermediary steps for dashboard
     debug_images = {}
-    debug_images["Original"] = image.copy()
-    
-    output = image.copy()
-    output2 = image.copy()
-    debug_output = image.copy()  # For showing FAST evaluation process
+    debug_images["Original"] = original_image.copy()
 
-    # Check if image is too sharp or too blurry
-    lap_var = cv2.Laplacian(image, cv2.CV_64F).var()
-    print(f"Laplacian variance: {lap_var:.2f}")
-    
-    # Store original image for final cropping
-    original_image = image.copy()
     manual_ellipse = _normalize_ellipse(manual_ellipse)
 
     if manual_roi and manual_ellipse is None:
@@ -614,7 +949,60 @@ def detect_elliptical_portafilter_with_holes(
         if manual_ellipse is None:
             print("Manual ROI selection cancelled; falling back to automatic detection.")
 
+    roi_offset = (0, 0)
+    yolo_bbox = None
+    if use_yolo_prefilter and manual_ellipse is None and not manual_roi:
+        yolo_bbox, yolo_score = detect_portafilter_bbox_yolo(
+            original_image,
+            model_path=yolo_model_path,
+            conf=yolo_conf,
+            iou=yolo_iou,
+            padding_ratio=yolo_padding_ratio,
+        )
+        if yolo_bbox is not None:
+            x1, y1, x2, y2 = yolo_bbox
+            roi_offset = (x1, y1)
+            image = original_image[y1:y2, x1:x2].copy()
+            if second_frame is not None:
+                if second_frame.shape[0] >= y2 and second_frame.shape[1] >= x2:
+                    second_frame = second_frame[y1:y2, x1:x2].copy()
+                else:
+                    second_frame = None
+                    print("Second frame is smaller than YOLO ROI bounds; skipping change-mask assist.")
+
+            yolo_overlay = original_image.copy()
+            cv2.rectangle(yolo_overlay, (x1, y1), (x2, y2), (0, 255, 255), 2)
+            cv2.putText(
+                yolo_overlay,
+                f"YOLO ROI conf={yolo_score:.2f}",
+                (x1, max(20, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2,
+            )
+            debug_images["YOLO ROI"] = yolo_overlay
+            print(f"Using YOLO prefilter ROI: {(x1, y1, x2, y2)} (conf={yolo_score:.3f})")
+        else:
+            print("YOLO prefilter not available or no detection found; using full frame.")
+
+    output = image.copy()
+    output2 = image.copy()
+    debug_output = image.copy()  # For showing FAST evaluation process
+
+    # Check if image is too sharp or too blurry
+    lap_var = cv2.Laplacian(image, cv2.CV_64F).var()
+    print(f"Laplacian variance: {lap_var:.2f}")
+
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    frame_h, frame_w = gray.shape[:2]
+    frame_area = float(frame_h * frame_w)
+
+    # Scale ellipse filters to the current frame/ROI size so cropped YOLO regions
+    # and full-frame fallback both behave consistently.
+    min_area_auto = max(1200.0, frame_area * 0.025)
+    min_area_mask = max(900.0, frame_area * 0.012)
+    min_axis_len = max(10.0, min(frame_h, frame_w) * 0.05)
 
     #  Change Mask between first frame (image) and provided second_frame 
     if second_frame is not None:
@@ -624,32 +1012,25 @@ def detect_elliptical_portafilter_with_holes(
             debug_images["Change Mask (Blurred)"] = change_mask_blurred
 
             # Detect ellipses from the change mask
-            mask_ellipses = []
-            mask_areas = []
             try:
                 # Morph close to connect regions for more stable contours
                 kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
                 cleaned_mask = cv2.morphologyEx(change_mask, cv2.MORPH_CLOSE, kernel_close)
 
-                contours_mask, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                for cnt in contours_mask:
-                    if len(cnt) < 5:
-                        continue
-                    ellipse = cv2.fitEllipse(cnt)
-                    (x_len, y_len) = ellipse[1]
-                    # Basic validation
-                    if x_len <= 0 or y_len <= 0:
-                        continue
-                    aspect_ratio = max(x_len, y_len) / max(1e-6, min(x_len, y_len))
-                    if aspect_ratio > 10 or min(x_len, y_len) < 10:
-                        continue
-                    area = x_len * y_len * np.pi
-                    mask_ellipses.append(ellipse)
-                    mask_areas.append(area)
+                mask_ellipses, mask_areas = _extract_ellipse_candidates_from_binary(
+                    cleaned_mask,
+                    min_area=min_area_mask,
+                    min_axis=min_axis_len,
+                    max_aspect=8.0,
+                )
             except Exception as e:
                 print(f"Failed to detect ellipses from change mask: {e}")
+                mask_ellipses = []
+                mask_areas = []
         except Exception as e:
             print(f"Failed to generate change mask: {e}")
+            mask_ellipses = []
+            mask_areas = []
     else:
         mask_ellipses = []
         mask_areas = []
@@ -690,8 +1071,22 @@ def detect_elliptical_portafilter_with_holes(
     # Use original/sharpened image for Hough line detection
     edges = cv2.Canny(gray, 50, 150, apertureSize=3)
     # Use blurred image ONLY for ellipse detection
-    el_edges = cv2.Canny(el_gray, 100, 200, apertureSize=3)
+    el_edges = cv2.Canny(el_gray, 90, 180, apertureSize=3)
     debug_images["Canny Edges"] = edges
+
+    # Additional edge maps improve ellipse candidate recall under varying lighting.
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    el_edges_alt = cv2.Canny(clahe, 70, 160, apertureSize=3)
+    el_edges_light = cv2.Canny(gray, 60, 150, apertureSize=3)
+
+    candidate_edge_map = cv2.bitwise_or(el_edges, el_edges_alt)
+    candidate_edge_map = cv2.bitwise_or(candidate_edge_map, el_edges_light)
+    candidate_edge_map = cv2.morphologyEx(
+        candidate_edge_map,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    )
+    debug_images["Ellipse Candidate Edges"] = candidate_edge_map
 
     #  1. Hough Line Detection
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=20, maxLineGap=10)
@@ -728,39 +1123,36 @@ def detect_elliptical_portafilter_with_holes(
     ellipses = []
     areas = []
     if manual_ellipse is None:
-        # 3. Ellipse Detection from Edges
-        contours, _ = cv2.findContours(el_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            if len(cnt) >= 5:
-                ellipse = cv2.fitEllipse(cnt)
-                area = ellipse[1][0] * ellipse[1][1] * np.pi # Calculate the area of the fitted ellipse
-                if area < 50000 :
-                    continue
-                if ellipse[1][0] <= 0 or ellipse[1][1] <= 0:
-                    continue  # skip bad ellipse
-                (x_len, y_len) = ellipse[1]
-                if x_len <= 0 or y_len <= 0:
-                    continue
+        if yolo_bbox is not None:
+            forced_bbox_ellipse = _ellipse_from_roi_bounds(
+                image.shape,
+                pad_ratio_x=0.08,
+                pad_ratio_y=0.10,
+            )
+            if forced_bbox_ellipse is not None:
+                forced_area = float(forced_bbox_ellipse[1][0] * forced_bbox_ellipse[1][1] * np.pi)
+                if _append_unique_ellipse(ellipses, areas, forced_bbox_ellipse, forced_area):
+                    safe_draw_ellipse(output, forced_bbox_ellipse, (255, 255, 0), 2)
+                    print("Added forced bbox-derived ellipse candidate.")
 
-                # Reject too flat (line-like) ellipses
-                aspect_ratio = max(x_len, y_len) / min(x_len, y_len)
-                if aspect_ratio > 10 or min(x_len, y_len) < 10:
-                    continue
-
-                ellipses.append(ellipse)
-                areas.append(area)
+        # 3. Ellipse detection from a combined edge map for better recall.
+        edge_ellipses, edge_areas = _extract_ellipse_candidates_from_binary(
+            candidate_edge_map,
+            min_area=min_area_auto,
+            min_axis=min_axis_len,
+            max_aspect=8.0,
+        )
+        for ellipse, area in zip(edge_ellipses, edge_areas):
+            if _append_unique_ellipse(ellipses, areas, ellipse, area):
                 safe_draw_ellipse(output, ellipse, (0, 0, 255), 1)
 
         # Merge in mask-derived ellipses
         for m_el, m_area in zip(mask_ellipses, mask_areas):
-            ellipses.append(m_el)
-            areas.append(m_area)
-            safe_draw_ellipse(output, m_el, (0, 255, 0), 1)
+            if _append_unique_ellipse(ellipses, areas, m_el, m_area):
+                safe_draw_ellipse(output, m_el, (0, 255, 0), 1)
     else:
         safe_draw_ellipse(output, manual_ellipse, (0, 255, 255), 2)
         debug_images["Manual Ellipse"] = output.copy()
-
-    debug_images["Detected Features"] = output
 
     # Step 4: Score and highlight best ellipse with FAST features
     if manual_ellipse is not None:
@@ -781,6 +1173,22 @@ def detect_elliptical_portafilter_with_holes(
                 ellipses,
                 key=lambda el: el[1][0] * el[1][1]  # selects by width × height
             )
+
+    detected_features_view = output.copy()
+    if best_ellipse is not None:
+        safe_draw_ellipse(detected_features_view, best_ellipse, (255, 0, 255), 4)
+        (sel_cx, sel_cy), _, _ = best_ellipse
+        cv2.putText(
+            detected_features_view,
+            "Selected",
+            (int(sel_cx) - 35, max(18, int(sel_cy) - 14)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    debug_images["Detected Features"] = detected_features_view
     
     # Create visualization showing FAST keypoints within the best ellipse
     best_ellipse_keypoints = []
@@ -851,10 +1259,24 @@ def detect_elliptical_portafilter_with_holes(
 
         debug_images["Ellipse Comparison"] = comparison_img
 
+    best_ellipse_full = _offset_ellipse(best_ellipse, roi_offset)
+
+    if yolo_bbox is not None:
+        x1, y1, x2, y2 = yolo_bbox
+        full_result = original_image.copy()
+        target_h = max(1, y2 - y1)
+        target_w = max(1, x2 - x1)
+        patch = output2
+        if patch.shape[0] != target_h or patch.shape[1] != target_w:
+            patch = cv2.resize(patch, (target_w, target_h))
+        full_result[y1:y2, x1:x2] = patch
+        cv2.rectangle(full_result, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        output2 = full_result
+
     debug_images["Final Result"] = output2
     
     # Use original image for final cropping (not sharpened or blurred)
-    cropped_img = crop_image_by_ellipse(original_image, best_ellipse)
+    cropped_img = crop_image_by_ellipse(original_image, best_ellipse_full)
     debug_images["Cropped Result"] = cropped_img
 
     # Reorder debug images for better slideshow flow.
@@ -863,6 +1285,8 @@ def detect_elliptical_portafilter_with_holes(
     # Add images in desired order
     if "Original" in debug_images:
         ordered_debug_images["Original"] = debug_images["Original"]
+    if "YOLO ROI" in debug_images:
+        ordered_debug_images["YOLO ROI"] = debug_images["YOLO ROI"]
     if "Sharpened" in debug_images:
         ordered_debug_images["Sharpened"] = debug_images["Sharpened"]
     if "Blurred" in debug_images:
@@ -899,8 +1323,8 @@ def detect_elliptical_portafilter_with_holes(
     }
     
     if return_debug:
-        return output2, best_ellipse, mode_size, fast_params, ordered_debug_images
-    return output2, best_ellipse, mode_size, fast_params
+        return output2, best_ellipse_full, mode_size, fast_params, ordered_debug_images
+    return output2, best_ellipse_full, mode_size, fast_params
 
 # Test Run
 if __name__ == "__main__":

@@ -865,19 +865,46 @@ class EspressoAnalysisApp:
 
         if len(channeling) > 0:
             times = np.arange(len(channeling)) / fps
-            channeling_arr = np.array(channeling)
-            ax_mid.plot(times, channeling_arr, color="red", linewidth=2, label="Visible holes")
+            channeling_arr = np.array(channeling, dtype=float)
+            ax_mid.plot(times, channeling_arr, color="red", linewidth=2.0, label="Visible holes (total)")
 
-            left_density_curve = np.array(feature_results.get("channel_left_density_curve") or [], dtype=float)
-            right_density_curve = np.array(feature_results.get("channel_right_density_curve") or [], dtype=float)
-            if len(left_density_curve) == len(channeling_arr) and np.any(~np.isnan(left_density_curve)):
-                ax_mid.plot(times, left_density_curve, color="#00509d", linewidth=1.2, alpha=0.8, label="Left density")
-            if len(right_density_curve) == len(channeling_arr) and np.any(~np.isnan(right_density_curve)):
-                ax_mid.plot(times, right_density_curve, color="#f77f00", linewidth=1.2, alpha=0.8, label="Right density")
+            quadrant_curves = feature_results.get("channel_quadrant_count_curves") or {}
+            q_tl = np.array(quadrant_curves.get("top_left") or [], dtype=float)
+            q_tr = np.array(quadrant_curves.get("top_right") or [], dtype=float)
+            q_bl = np.array(quadrant_curves.get("bottom_left") or [], dtype=float)
+            q_br = np.array(quadrant_curves.get("bottom_right") or [], dtype=float)
 
-            ax_mid.set_title("Channeling count per frame")
+            if (
+                len(q_tl) == len(channeling_arr)
+                and len(q_tr) == len(channeling_arr)
+                and len(q_bl) == len(channeling_arr)
+                and len(q_br) == len(channeling_arr)
+            ):
+                q_sum = q_tl + q_tr + q_bl + q_br
+
+                ax_mid.plot(times, q_tl, color="#1f77b4", linewidth=1.1, alpha=0.9, label="Top-left")
+                ax_mid.plot(times, q_tr, color="#ff7f0e", linewidth=1.1, alpha=0.9, label="Top-right")
+                ax_mid.plot(times, q_bl, color="#2ca02c", linewidth=1.1, alpha=0.9, label="Bottom-left")
+                ax_mid.plot(times, q_br, color="#9467bd", linewidth=1.1, alpha=0.9, label="Bottom-right")
+                ax_mid.plot(times, q_sum, color="black", linewidth=1.3, linestyle="--", label="Quadrant sum")
+
+                max_diff = float(np.nanmax(np.abs(channeling_arr - q_sum))) if len(q_sum) > 0 else 0.0
+                if max_diff > 0.5:
+                    ax_mid.text(
+                        0.01,
+                        0.97,
+                        f"Warning: max total-vs-sum diff = {max_diff:.0f}",
+                        transform=ax_mid.transAxes,
+                        fontsize=9,
+                        va="top",
+                        ha="left",
+                        color="#b00020",
+                        bbox=dict(boxstyle="round,pad=0.2", facecolor="#ffe8e8", alpha=0.8),
+                    )
+
+            ax_mid.set_title("Channeling keypoints per frame (count curves)")
             ax_mid.set_xlabel("Time (s)")
-            ax_mid.set_ylabel("Hole count")
+            ax_mid.set_ylabel("Keypoint count")
             ax_mid.grid(alpha=0.3)
             ax_mid.fill_between(times, channeling_arr, alpha=0.3, color="red")
             ax_mid.legend(loc="best")

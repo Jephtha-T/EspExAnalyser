@@ -124,14 +124,19 @@ def load_frames(folder):
 def detect_flow_start_end(
     frames_gray: List[np.ndarray],
     roi: Tuple[int, int, int, int],
-    pixel_diff_thresh: int = 15,
-    change_fraction_thresh: float = 0.005,
+    pixel_diff_thresh: int = 10,
+    change_fraction_thresh: float = 0.003,
     start_consec_frames: int = 2,
-    end_consec_frames: int = 5,
+    end_consec_frames: int = 3,
     smoothing_window: int = 3,
     end_lookback_window: int = 10,
+    min_shot_duration_seconds: float = 5.0,
+    fps: float = 1.0,
 ) -> Tuple[int, int, Dict[str, object]]:
-    # Detect shot start/end from frame changes using adaptive thresholds and hysteresis.
+    # Detect shot start/end from frame changes with explicit consecutive-frame rules:
+    # - Start: >=2 consecutive frames above small-change threshold
+    # - End  : >=3 consecutive frames below low-change threshold
+    # End detection only starts after a minimum elapsed duration.
     y1, y2, x1, x2 = roi
     roi_area = (y2 - y1) * (x2 - x1)
     if roi_area <= 0:
@@ -140,7 +145,7 @@ def detect_flow_start_end(
     if len(frames_gray) < 2:
         metrics = {
             "start_threshold": float(change_fraction_thresh),
-            "end_threshold": float(change_fraction_thresh) * 0.5,
+            "end_threshold": float(change_fraction_thresh) * 0.6,
             "baseline_noise": 0.0,
             "peak_change": 0.0,
             "mean_change_during_shot": 0.0,
@@ -173,15 +178,14 @@ def detect_flow_start_end(
     baseline_mad = float(np.median(np.abs(baseline - baseline_med))) if len(baseline) > 0 else 0.0
     baseline_sigma = 1.4826 * baseline_mad
 
-    start_threshold = float(max(change_fraction_thresh, baseline_med + 4.0 * baseline_sigma))
-    start_threshold = float(min(start_threshold, max(change_fraction_thresh * 3.0, np.max(smoothed_changes) * 0.90)))
-    end_threshold = float(max(baseline_med + 2.0 * baseline_sigma, start_threshold * 0.45))
-    if end_threshold >= start_threshold:
-        end_threshold = max(change_fraction_thresh * 0.5, start_threshold * 0.7)
+    start_threshold = float(max(1e-6, change_fraction_thresh))
+    end_threshold = float(max(1e-6, start_threshold * 0.6))
+
+    detection_series = change_fractions_array
 
     start_frame = None
     consec = 0
-    for i, frac in enumerate(smoothed_changes):
+    for i, frac in enumerate(detection_series):
         if float(frac) >= start_threshold:
             consec += 1
             if consec >= start_consec_frames:
@@ -191,16 +195,16 @@ def detect_flow_start_end(
             consec = 0
 
     if start_frame is None:
-        peak_idx = int(np.argmax(smoothed_changes)) if len(smoothed_changes) else 0
-        if len(smoothed_changes) and float(smoothed_changes[peak_idx]) >= change_fraction_thresh:
+        peak_idx = int(np.argmax(detection_series)) if len(detection_series) else 0
+        if len(detection_series) and float(detection_series[peak_idx]) >= start_threshold:
             start_frame = max(0, peak_idx - 1)
         else:
             metrics = {
                 "start_threshold": start_threshold,
                 "end_threshold": end_threshold,
                 "baseline_noise": float(baseline_sigma),
-                "peak_change": float(np.max(smoothed_changes)) if len(smoothed_changes) else 0.0,
-                "mean_change_during_shot": float(np.mean(smoothed_changes)) if len(smoothed_changes) else 0.0,
+                "peak_change": float(np.max(detection_series)) if len(detection_series) else 0.0,
+                "mean_change_during_shot": float(np.mean(detection_series)) if len(detection_series) else 0.0,
                 "start_confidence": 0.0,
                 "end_confidence": 0.0,
                 "quality_score": 0.0,
@@ -208,16 +212,20 @@ def detect_flow_start_end(
             }
             return 0, len(frames_gray) - 1, metrics
 
-    peak_relative = int(np.argmax(smoothed_changes[start_frame:])) if start_frame < len(smoothed_changes) else 0
+    peak_relative = int(np.argmax(detection_series[start_frame:])) if start_frame < len(detection_series) else 0
     peak_idx = start_frame + peak_relative
 
     end_frame = len(frames_gray) - 1
+    fps_safe = max(1e-6, float(fps))
+    min_required_frames = max(1, int(round(float(min_shot_duration_seconds) * fps_safe)))
+    min_end_frame = min(len(frames_gray) - 1, start_frame + min_required_frames - 1)
+
     lookback = max(3, int(end_lookback_window))
     consec = 0
-    for i in range(max(start_frame + 1, peak_idx), len(smoothed_changes)):
-        window_start = max(start_frame, i - lookback + 1)
-        rolling_mean = float(np.mean(smoothed_changes[window_start:i + 1]))
-        if rolling_mean <= end_threshold:
+    end_scan_start = max(start_frame + 1, peak_idx, min_end_frame)
+    for i in range(end_scan_start, len(detection_series)):
+        frac = float(detection_series[i])
+        if frac <= end_threshold:
             consec += 1
             if consec >= end_consec_frames:
                 end_frame = i - consec + 1
@@ -225,22 +233,27 @@ def detect_flow_start_end(
         else:
             consec = 0
 
+    forced_min_duration = False
+    if end_frame < min_end_frame:
+        end_frame = min_end_frame
+        forced_min_duration = True
+
     end_frame = int(max(start_frame, min(end_frame, len(frames_gray) - 1)))
 
-    shot_slice = smoothed_changes[start_frame:end_frame + 1] if end_frame >= start_frame else smoothed_changes
+    shot_slice = detection_series[start_frame:end_frame + 1] if end_frame >= start_frame else detection_series
     peak_change = float(np.max(shot_slice)) if len(shot_slice) else 0.0
     mean_change = float(np.mean(shot_slice)) if len(shot_slice) else 0.0
 
-    start_level = float(np.mean(smoothed_changes[start_frame:min(len(smoothed_changes), start_frame + start_consec_frames + 1)]))
-    start_confidence = float(np.clip((start_level - start_threshold) / (max(1e-6, peak_change - baseline_med)), 0.0, 1.0))
+    start_level = float(np.mean(detection_series[start_frame:min(len(detection_series), start_frame + start_consec_frames + 1)]))
+    start_confidence = float(np.clip((start_level - start_threshold) / max(1e-6, peak_change - start_threshold + 1e-6), 0.0, 1.0))
 
-    if end_frame < len(smoothed_changes) - 1:
-        post_window = smoothed_changes[end_frame + 1:min(len(smoothed_changes), end_frame + 1 + lookback)]
-        post_level = float(np.mean(post_window)) if len(post_window) else float(smoothed_changes[end_frame])
+    if end_frame < len(detection_series) - 1:
+        post_window = detection_series[end_frame + 1:min(len(detection_series), end_frame + 1 + lookback)]
+        post_level = float(np.mean(post_window)) if len(post_window) else float(detection_series[end_frame])
     else:
-        post_level = float(smoothed_changes[end_frame - 1]) if end_frame > 0 else baseline_med
+        post_level = float(detection_series[end_frame - 1]) if end_frame > 0 else baseline_med
     end_drop = max(0.0, peak_change - post_level)
-    end_confidence = float(np.clip(end_drop / max(1e-6, peak_change - baseline_med), 0.0, 1.0))
+    end_confidence = float(np.clip(end_drop / max(1e-6, peak_change - end_threshold), 0.0, 1.0))
 
     quality_flags = []
     if start_confidence < 0.35:
@@ -251,9 +264,11 @@ def detect_flow_start_end(
         quality_flags.append("start_near_first_frame")
     if end_frame >= len(frames_gray) - 2:
         quality_flags.append("end_near_last_frame")
-    if (end_frame - start_frame + 1) < max(6, int(len(frames_gray) * 0.08)):
+    if forced_min_duration:
+        quality_flags.append("min_duration_forced")
+    if (end_frame - start_frame + 1) < min_required_frames:
         quality_flags.append("very_short_flow_window")
-    if peak_change < max(change_fraction_thresh * 1.15, start_threshold * 1.05):
+    if peak_change < max(start_threshold * 1.05, end_threshold * 1.2):
         quality_flags.append("weak_motion_signal")
 
     quality_score = float(np.clip((start_confidence + end_confidence) * 0.5 - 0.08 * len(quality_flags), 0.0, 1.0))
@@ -266,6 +281,7 @@ def detect_flow_start_end(
         "start_threshold": start_threshold,
         "end_threshold": end_threshold,
         "baseline_noise": float(baseline_sigma),
+        "min_required_frames": int(min_required_frames),
         "peak_change": peak_change,
         "mean_change_during_shot": mean_change,
         "start_confidence": start_confidence,
@@ -1486,15 +1502,22 @@ def extract_colour_and_blonding(frames_bgr,
                     flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS,
                 )
 
+        quadrant_counts = count_channeling_quadrants(
+            hole_keypoints,
+            portafilter_ellipse=portafilter_ellipse,
+        )
+        quadrant_total = int(sum(int(value) for value in quadrant_counts.values()))
+        if quadrant_total != int(hole_count):
+            print(
+                f"Channeling count alignment: total={int(hole_count)} adjusted_to_quadrants={quadrant_total}"
+            )
+        hole_count = quadrant_total
+
         channeling_counts.append(hole_count)
         frame_conf = float(hole_meta.get("detection_confidence", 0.0))
         channeling_confidence_curve.append(frame_conf)
         channeling_valid_curve.append(1 if (frame_conf >= 0.25 and hole_count >= 0) else 0)
 
-        quadrant_counts = count_channeling_quadrants(
-            hole_keypoints,
-            portafilter_ellipse=portafilter_ellipse,
-        )
         for key in quadrant_count_curves.keys():
             q_count = int(quadrant_counts.get(key, 0))
             quadrant_count_curves[key].append(q_count)
@@ -1656,53 +1679,80 @@ def extract_colour_and_blonding(frames_bgr,
 
         prev_gray = curr_gray
 
-    brightness_curve = np.array(brightness_curve)
-    saturation_curve = np.array(saturation_curve)
-    hue_curve = np.array(hue_curve)
+    brightness_curve = np.array(brightness_curve, dtype=np.float32)
+    saturation_curve = np.array(saturation_curve, dtype=np.float32)
+    hue_curve = np.array(hue_curve, dtype=np.float32)
 
     valid = ~np.isnan(brightness_curve)
+    valid_count = int(np.sum(valid))
+    sample_count = int(len(brightness_curve))
 
-    if np.sum(valid) < 3:
-        return None
+    # Very short or low-signal flow windows can produce sparse curves.
+    # Keep the pipeline alive with a conservative fallback instead of returning None.
+    if sample_count == 0:
+        brightness_curve = np.array([0.0], dtype=np.float32)
+        saturation_curve = np.array([0.0], dtype=np.float32)
+        hue_curve = np.array([0.0], dtype=np.float32)
+        valid = np.array([True], dtype=bool)
+        valid_count = 1
+        sample_count = 1
 
-    norm_brightness = (
-        brightness_curve - np.nanmin(brightness_curve)
-    ) / (np.nanmax(brightness_curve) - np.nanmin(brightness_curve) + 1e-6)
+    if valid_count == 0:
+        brightness_curve = np.zeros_like(brightness_curve, dtype=np.float32)
+    elif valid_count < sample_count:
+        fill_value = float(np.nanmean(brightness_curve[valid]))
+        brightness_curve = np.where(np.isnan(brightness_curve), fill_value, brightness_curve)
 
-    norm_brightness_temp = norm_brightness.copy()
-    for i in range(len(norm_brightness_temp)):
-        if np.isnan(norm_brightness_temp[i]):
-            valid_indices = np.where(~np.isnan(norm_brightness))[0]
-            if len(valid_indices) > 0:
-                nearest = valid_indices[np.argmin(np.abs(valid_indices - i))]
-                norm_brightness_temp[i] = norm_brightness[nearest]
-            else:
-                norm_brightness_temp[i] = 0.5
-    
-    norm_brightness = np.convolve(
-        norm_brightness_temp,
-        np.ones(3) / 3,
-        mode='same'
-    )
+    if sample_count < 2:
+        norm_brightness = np.zeros(sample_count, dtype=np.float32)
+        derivative = np.zeros(sample_count, dtype=np.float32)
+        blond_idx = 0
+        blond_rate = 0.0
+    else:
+        b_min = float(np.min(brightness_curve))
+        b_max = float(np.max(brightness_curve))
+        norm_brightness = (brightness_curve - b_min) / (b_max - b_min + 1e-6)
 
-    # Blonding point is where brightness rises fastest after the initial pour transient.
-    derivative = np.gradient(norm_brightness)
-    derivative = np.convolve(derivative, np.ones(3) / 3, mode='same')
+        norm_brightness_temp = norm_brightness.copy()
+        for i in range(len(norm_brightness_temp)):
+            if np.isnan(norm_brightness_temp[i]):
+                valid_indices = np.where(~np.isnan(norm_brightness))[0]
+                if len(valid_indices) > 0:
+                    nearest = valid_indices[np.argmin(np.abs(valid_indices - i))]
+                    norm_brightness_temp[i] = norm_brightness[nearest]
+                else:
+                    norm_brightness_temp[i] = 0.5
 
-    sample_count = len(norm_brightness)
-    warmup = min(max(3, int(sample_count * 0.15)), max(0, sample_count - 1))
-    candidate_indices = np.arange(warmup, sample_count)
-    if len(candidate_indices) == 0:
-        candidate_indices = np.arange(sample_count)
+        norm_brightness = np.convolve(
+            norm_brightness_temp,
+            np.ones(3) / 3,
+            mode='same'
+        )
 
-    # Ignore very dark early values to avoid false blonding picks during flow onset.
-    brightness_gate = norm_brightness[candidate_indices] >= 0.25
-    gated_indices = candidate_indices[brightness_gate]
-    if len(gated_indices) > 0:
-        candidate_indices = gated_indices
+        # Blonding point is where brightness rises fastest after the initial pour transient.
+        derivative = np.gradient(norm_brightness)
+        derivative = np.convolve(derivative, np.ones(3) / 3, mode='same')
 
-    blond_idx = int(candidate_indices[np.argmax(derivative[candidate_indices])])
-    blond_rate = float(derivative[blond_idx])
+        sample_count = len(norm_brightness)
+        warmup = min(max(3, int(sample_count * 0.15)), max(0, sample_count - 1))
+        candidate_indices = np.arange(warmup, sample_count)
+        if len(candidate_indices) == 0:
+            candidate_indices = np.arange(sample_count)
+
+        # Ignore very dark early values to avoid false blonding picks during flow onset.
+        brightness_gate = norm_brightness[candidate_indices] >= 0.25
+        gated_indices = candidate_indices[brightness_gate]
+        if len(gated_indices) > 0:
+            candidate_indices = gated_indices
+
+        blond_idx = int(candidate_indices[np.argmax(derivative[candidate_indices])])
+        blond_rate = float(derivative[blond_idx])
+
+    if valid_count < 3:
+        print(
+            f"Warning: sparse blonding signal ({valid_count} valid samples across {sample_count} frame(s)); "
+            "using low-confidence fallback estimate."
+        )
 
     blond_frame = start_frame + 1 + blond_idx
 
@@ -1874,12 +1924,14 @@ def extract_features_from_video(cropped_frames_dir=None,
     start_frame, end_frame, flow_metrics = detect_flow_start_end(
         frames_gray=frames_gray,
         roi=roi,
-        pixel_diff_thresh=15,           # Lower threshold for subtle changes
-        change_fraction_thresh=0.005,   # Lower threshold for slow flow
-        start_consec_frames=2,          # Still need quick response for start
-        end_consec_frames=5,            # More frames to confirm end (handles choked shots)
-        smoothing_window=3,             # Smooth out noise
-        end_lookback_window=10          # Rolling average for robust end detection
+        pixel_diff_thresh=10,           # Small pixel-change threshold for flow detection
+        change_fraction_thresh=0.003,   # Small fraction threshold for "any flow"
+        start_consec_frames=2,          # Start when 2 consecutive frames show flow
+        end_consec_frames=3,            # End when 3 consecutive frames show low flow
+        smoothing_window=3,             # Smooth out noise while keeping responsiveness
+        end_lookback_window=10,         # Rolling average for stable end checks
+        min_shot_duration_seconds=5.0,  # End detection starts only after 5 seconds
+        fps=1.0,
     )
 
     print("\nFlow Detection Results:")
