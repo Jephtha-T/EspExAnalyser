@@ -28,6 +28,60 @@ def load_all_frames(frames_dir, frame_files):
     return frames
 
 
+def _compute_resize_scale(frame_shape, max_width=None):
+    if max_width is None:
+        return 1.0
+    height, width = frame_shape[:2]
+    if width <= 0 or width <= int(max_width):
+        return 1.0
+    return float(max_width) / float(width)
+
+
+def _resize_frame(frame, scale):
+    if scale >= 0.999:
+        return frame
+    resized_w = max(1, int(round(frame.shape[1] * float(scale))))
+    resized_h = max(1, int(round(frame.shape[0] * float(scale))))
+    return cv2.resize(frame, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
+
+
+def _scale_ellipse(ellipse, scale):
+    if ellipse is None or scale >= 0.999:
+        return ellipse
+    return (
+        (float(ellipse[0][0]) * float(scale), float(ellipse[0][1]) * float(scale)),
+        (float(ellipse[1][0]) * float(scale), float(ellipse[1][1]) * float(scale)),
+        float(ellipse[2]),
+    )
+
+
+def _rescale_centers(centers, inverse_scale):
+    if inverse_scale == 1.0:
+        return centers
+    return [
+        (float(center[0]) * float(inverse_scale), float(center[1]) * float(inverse_scale))
+        for center in centers
+    ]
+
+
+def _rescale_fast_params(fast_params, inverse_scale):
+    if fast_params is None or inverse_scale == 1.0:
+        return fast_params
+    scaled = dict(fast_params)
+    if "size_tolerance" in scaled:
+        try:
+            scaled["size_tolerance"] = max(1, int(round(float(scaled["size_tolerance"]) * float(inverse_scale))))
+        except (TypeError, ValueError):
+            pass
+    return scaled
+
+
+def _rescale_mode_size(hole_mode_size, inverse_scale):
+    if hole_mode_size is None or inverse_scale == 1.0:
+        return hole_mode_size
+    return float(hole_mode_size) * float(inverse_scale)
+
+
 def preprocess_tracking_frame(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -177,14 +231,18 @@ def update_filtered_center(previous_center, measured_center, score):
     )
 
 
-def track_portafilter_motion(frames, ellipse):
+def track_portafilter_motion(frames, ellipse, max_tracking_width=960):
     if len(frames) == 0:
         raise RuntimeError("No frames available for tracking")
 
-    reference_center = (float(ellipse[0][0]), float(ellipse[0][1]))
-    tracking_grays = [preprocess_tracking_frame(frame) for frame in frames]
+    tracking_scale = _compute_resize_scale(frames[0].shape, max_width=max_tracking_width)
+    inverse_scale = 1.0 / tracking_scale if tracking_scale > 0 else 1.0
+    tracking_frames = [_resize_frame(frame, tracking_scale) for frame in frames]
+    ellipse_scaled = _scale_ellipse(ellipse, tracking_scale)
+    reference_center = (float(ellipse_scaled[0][0]), float(ellipse_scaled[0][1]))
+    tracking_grays = [preprocess_tracking_frame(frame) for frame in tracking_frames]
 
-    template_bounds = get_portafilter_template_bounds(frames[0].shape, ellipse, padding=18)
+    template_bounds = get_portafilter_template_bounds(tracking_frames[0].shape, ellipse_scaled, padding=18)
     template_gray = crop_with_padding(tracking_grays[0], template_bounds)
     template_h, template_w = template_gray.shape[:2]
 
@@ -201,7 +259,7 @@ def track_portafilter_motion(frames, ellipse):
             template_gray,
             filtered_centers[-1],
             reference_center,
-            frames[index].shape,
+            tracking_frames[index].shape,
         )
 
         if source == "reference":
@@ -222,21 +280,25 @@ def track_portafilter_motion(frames, ellipse):
             template_gray = cv2.addWeighted(template_gray, 0.85, fresh_template, 0.15, 0.0)
             template_updates += 1
 
+    measured_centers_original = _rescale_centers(measured_centers, inverse_scale)
+    filtered_centers_original = _rescale_centers(filtered_centers, inverse_scale)
+    reference_center_original = measured_centers_original[0]
     displacements = [
-        float(np.hypot(center[0] - reference_center[0], center[1] - reference_center[1]))
-        for center in filtered_centers
+        float(np.hypot(center[0] - reference_center_original[0], center[1] - reference_center_original[1]))
+        for center in filtered_centers_original
     ]
 
     return {
-        "reference_center": reference_center,
-        "measured_centers": measured_centers,
-        "filtered_centers": filtered_centers,
+        "reference_center": reference_center_original,
+        "measured_centers": measured_centers_original,
+        "filtered_centers": filtered_centers_original,
         "match_scores": match_scores,
         "template_shape": (template_h, template_w),
         "template_updates": template_updates,
         "reference_searches": reference_searches,
         "low_confidence_fallbacks": low_confidence_fallbacks,
         "average_match_score": float(np.mean(match_scores)) if match_scores else 0.0,
+        "tracking_scale": float(tracking_scale),
         "max_center_displacement": float(max(displacements)) if displacements else 0.0,
     }
 
@@ -257,31 +319,43 @@ def crop_frame_locked(frame, center, reference_crop_bounds, reference_center):
     return crop_with_padding(frame, crop_bounds)
 
 
+def generate_locked_crops(frames, reference_crop_bounds, reference_center, centers):
+    return [
+        crop_frame_locked(frame, center, reference_crop_bounds, reference_center)
+        for frame, center in zip(frames, centers)
+    ]
+
+
 def save_locked_crops(frames, output_dir, reference_crop_bounds, reference_center, centers):
     os.makedirs(output_dir, exist_ok=True)
+    crops = generate_locked_crops(frames, reference_crop_bounds, reference_center, centers)
 
     print("Saving locked ROI crops (v2)")
-    for index, (frame, center) in enumerate(zip(frames, centers)):
-        roi = crop_frame_locked(frame, center, reference_crop_bounds, reference_center)
+    for index, roi in enumerate(crops):
         output_path = os.path.join(output_dir, f"frame_{index:04d}.jpg")
         cv2.imwrite(output_path, roi)
 
-    print(f"Saved {len(centers)} cropped frames")
+    print(f"Saved {len(crops)} cropped frames")
+    return crops
 
 
-def detect_reference_ellipse(frames, manual_roi=False, manual_ellipse=None):
+def detect_reference_ellipse(frames, manual_roi=False, manual_ellipse=None, detection_max_width=1280):
     if len(frames) == 0:
         raise RuntimeError("No frames available for detection")
 
     frame1 = frames[0]
     frame2 = frames[min(20, len(frames) - 1)]
+    detection_scale = _compute_resize_scale(frame1.shape, max_width=detection_max_width)
+    inverse_scale = 1.0 / detection_scale if detection_scale > 0 else 1.0
+    frame1_working = _resize_frame(frame1, detection_scale)
+    frame2_working = _resize_frame(frame2, detection_scale)
 
     print("Detecting portafilter ellipse...")
     _, ellipse, hole_mode_size, fast_params = detect_elliptical_portafilter_with_holes(
-        frame1,
+        frame1_working,
         save_dashboard=False,
         use_interactive=False,
-        second_frame=frame2,
+        second_frame=frame2_working,
         mask_threshold=15,
         manual_roi=manual_roi,
         manual_ellipse=manual_ellipse,
@@ -292,26 +366,38 @@ def detect_reference_ellipse(frames, manual_roi=False, manual_ellipse=None):
 
     print("Portafilter ellipse detected")
     print(f"Hole mode size: {hole_mode_size}")
-    return ellipse, hole_mode_size, fast_params
+    return (
+        _scale_ellipse(ellipse, inverse_scale),
+        _rescale_mode_size(hole_mode_size, inverse_scale),
+        _rescale_fast_params(fast_params, inverse_scale),
+    )
 
 
 def process_portafilter_tracking_v2(
     frames_dir=None,
     output_dir=None,
+    frames=None,
     manual_roi=False,
     manual_ellipse=None,
     stabilise_before_detection=True,
+    save_crops=True,
+    return_crops=False,
+    detection_max_width=1280,
+    tracking_max_width=960,
 ):
     if frames_dir is None:
         frames_dir = Input_Dir
     if output_dir is None:
         output_dir = Crop_Dir
 
-    frame_files = list_frame_files(frames_dir)
-    if not frame_files:
-        raise RuntimeError("No frames found in directory")
+    if frames is None:
+        frame_files = list_frame_files(frames_dir)
+        if not frame_files:
+            raise RuntimeError("No frames found in directory")
+        frames = load_all_frames(frames_dir, frame_files)
+    else:
+        frames = list(frames)
 
-    frames = load_all_frames(frames_dir, frame_files)
     if len(frames) < 2:
         raise RuntimeError("Not enough frames for tracking")
 
@@ -338,6 +424,7 @@ def process_portafilter_tracking_v2(
             frames,
             manual_roi=manual_roi,
             manual_ellipse=manual_ellipse,
+            detection_max_width=detection_max_width,
         )
 
     crop_bounds = get_crop_bounds(reference_frame.shape, ellipse, padding=12)
@@ -345,7 +432,7 @@ def process_portafilter_tracking_v2(
 
     if stabilise_before_detection:
         print("Tracking basket motion and locking the ROI (v2)")
-        tracking = track_portafilter_motion(frames, ellipse)
+        tracking = track_portafilter_motion(frames, ellipse, max_tracking_width=tracking_max_width)
         crop_centers = tracking["filtered_centers"]
         print(
             "Tracking stats: "
@@ -369,17 +456,26 @@ def process_portafilter_tracking_v2(
         }
         crop_centers = tracking["filtered_centers"]
 
-    save_locked_crops(
-        frames,
-        output_dir,
-        reference_crop_bounds=crop_bounds,
-        reference_center=reference_center,
-        centers=crop_centers,
-    )
+    cropped_frames = None
+    if save_crops:
+        cropped_frames = save_locked_crops(
+            frames,
+            output_dir,
+            reference_crop_bounds=crop_bounds,
+            reference_center=reference_center,
+            centers=crop_centers,
+        )
+    elif return_crops:
+        cropped_frames = generate_locked_crops(
+            frames,
+            reference_crop_bounds=crop_bounds,
+            reference_center=reference_center,
+            centers=crop_centers,
+        )
 
     ellipse_crop_coords = ellipse_in_crop_coords(ellipse, crop_bounds)
 
-    return {
+    result = {
         "ellipse": ellipse,
         "ellipse_in_crop": ellipse_crop_coords,
         "hole_mode_size": hole_mode_size,
@@ -395,6 +491,9 @@ def process_portafilter_tracking_v2(
             "max_center_displacement": tracking["max_center_displacement"],
         },
     }
+    if return_crops:
+        result["cropped_frames"] = cropped_frames if cropped_frames is not None else []
+    return result
 
 
 def _clear_image_files(folder):

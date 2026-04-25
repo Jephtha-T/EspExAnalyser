@@ -122,6 +122,17 @@ def load_frames(folder):
 
     return frames, frames_gray, frame_files
 
+
+def build_frame_arrays(frames_bgr, frame_names=None):
+    frames = [frame for frame in (frames_bgr or []) if frame is not None]
+    if len(frames) == 0:
+        raise RuntimeError("No frames supplied for feature extraction")
+
+    frames_gray = [cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) for frame in frames]
+    if frame_names is None:
+        frame_names = [f"frame_{index:04d}.jpg" for index in range(len(frames))]
+    return frames, frames_gray, frame_names
+
 def detect_flow_start_end(
     frames_gray: List[np.ndarray],
     roi: Tuple[int, int, int, int],
@@ -1903,6 +1914,8 @@ def extract_features_from_video(cropped_frames_dir=None,
                                detect_channeling=True,
                                show_gui=True,
                                capture_channeling_frames=True,
+                               frames_bgr_override=None,
+                               frame_names_override=None,
                                portafilter_override_ellipse=None,
                                portafilter_override_hole_size=None,
                                portafilter_override_fast_params=None):
@@ -1914,8 +1927,15 @@ def extract_features_from_video(cropped_frames_dir=None,
     if output_results_dir is None:
         output_results_dir = output_dir
 
-    print(f"Loading frames")
-    frames_bgr, frames_gray, frame_names = load_frames(cropped_frames_dir)
+    if frames_bgr_override is not None:
+        print("Loading frames from in-memory tracking output")
+        frames_bgr, frames_gray, frame_names = build_frame_arrays(
+            frames_bgr_override,
+            frame_names=frame_names_override,
+        )
+    else:
+        print(f"Loading frames")
+        frames_bgr, frames_gray, frame_names = load_frames(cropped_frames_dir)
     print(f"Loaded {len(frames_gray)} frames")
 
     H, W = frames_gray[0].shape

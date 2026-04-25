@@ -74,6 +74,15 @@ def _load_portafilter_yolo_model(model_path=None):
         return None, str(exc)
 
 
+def preload_portafilter_yolo_model(model_path=None):
+    model, load_error = _load_portafilter_yolo_model(model_path=model_path)
+    return {
+        "loaded": model is not None,
+        "error": load_error,
+        "path": _YOLO_MODEL_CACHE.get("path"),
+    }
+
+
 def _detect_portafilter_bbox_yolo_subprocess(image, resolved_model_path, conf=0.25, iou=0.45):
     if image is None or image.size == 0:
         return None, None, "empty image"
