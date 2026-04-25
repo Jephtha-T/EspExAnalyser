@@ -1,0 +1,133 @@
+{
+  "flags": [
+    {
+      "code": "localized_single_quadrant_channeling",
+      "title": "Localised Single-Quadrant Channelling",
+      "category": "channeling",
+      "description": "One quadrant is carrying a disproportionate share of the visible channeling signal.",
+      "score_expr": "min(dominant_quadrant_share / 0.42 if dominant_quadrant_share > 0 else 0.0, dominant_to_second_ratio / 1.35 if dominant_to_second_ratio > 0 else 0.0, 0.92 / max(1e-6, channel_spatial_entropy) if channel_spatial_entropy > 0 else 1.0, channel_moderate_frame_ratio / 0.20 if channel_moderate_frame_ratio > 0 else 0.0)",
+      "when_expr": "dominant_quadrant_share >= 0.42 and dominant_to_second_ratio >= 1.35 and channel_spatial_entropy <= 0.92 and channel_moderate_frame_ratio >= 0.20",
+      "reason": "One quadrant is repeatedly dominating the visible channeling pattern.",
+      "evidence": {
+        "dominant_quadrant": "dominant_quadrant",
+        "dominant_quadrant_share": "round4(dominant_quadrant_share)",
+        "dominant_to_second_ratio": "round4(dominant_to_second_ratio)",
+        "channel_spatial_entropy": "round4(channel_spatial_entropy)"
+      }
+    },
+    {
+      "code": "one_sided_extraction_bias",
+      "title": "One-Sided Extraction / Tamping Bias",
+      "category": "distribution",
+      "description": "One side of the basket is extracting more strongly than the opposite side.",
+      "score_expr": "min(side_bias_strength / 0.22 if side_bias_strength > 0 else 0.0, side_dominance_ratio / 1.35 if side_dominance_ratio > 0 else 0.0, channel_moderate_frame_ratio / 0.18 if channel_moderate_frame_ratio > 0 else 0.0)",
+      "when_expr": "side_bias_strength >= 0.22 and side_dominance_ratio >= 1.35 and channel_moderate_frame_ratio >= 0.18",
+      "reason": "Adjacent quadrants on one side are consistently stronger than the opposite side.",
+      "evidence": {
+        "dominant_axis": "dominant_axis(channel_lr_bias, channel_tb_bias)",
+        "side_bias_strength": "round4(side_bias_strength)",
+        "side_dominance_ratio": "round4(side_dominance_ratio)"
+      }
+    },
+    {
+      "code": "global_high_channeling_unstable_puck",
+      "title": "Global High Channelling / Unstable Puck",
+      "category": "channeling",
+      "description": "Channeling appears broadly distributed across the basket rather than confined to one location.",
+      "score_expr": "min(channel_mean_norm / 2.5 if channel_mean_norm > 0 else 0.0, channel_high_frame_ratio / 0.25 if channel_high_frame_ratio > 0 else 0.0, channel_spatial_entropy / 0.90 if channel_spatial_entropy > 0 else 0.0)",
+      "when_expr": "channel_mean_norm >= 2.5 and channel_high_frame_ratio >= 0.25 and channel_spatial_entropy >= 0.90 and dominant_quadrant_share <= 0.40",
+      "reason": "Channeling stays high across much of the basket rather than staying localised.",
+      "evidence": {
+        "channel_mean_norm": "round4(channel_mean_norm)",
+        "channel_high_frame_ratio": "round4(channel_high_frame_ratio)",
+        "channel_spatial_entropy": "round4(channel_spatial_entropy)"
+      }
+    },
+    {
+      "code": "likely_under_extraction_fast_early_blonding",
+      "title": "Likely Under-Extraction",
+      "category": "extraction",
+      "description": "The shot is fast and blonding arrives early, suggesting low resistance and short contact time.",
+      "score_expr": "min(18.0 / max(1e-6, shot_time_s) if shot_time_s > 0 else 0.0, blond_rate / 0.12 if blond_rate > 0 else 0.0, 0.35 / max(1e-6, blond_60_norm) if blond_60_norm not in (None, 0.0) else 1.0)",
+      "when_expr": "shot_time_s <= 18.0 and ((blond_60_norm is not None and blond_60_norm <= 0.35) or blond_rate >= 0.12)",
+      "reason": "The shot is short and blonding arrives early.",
+      "evidence": {
+        "shot_time_s": "round(shot_time_s, 3)",
+        "blond_rate": "round4(blond_rate)",
+        "blond_60_norm": "round_or_none(blond_60_norm, 4)"
+      }
+    },
+    {
+      "code": "likely_over_extraction_long_slow_blonding",
+      "title": "Likely Over-Extraction",
+      "category": "extraction",
+      "description": "The shot is long and blonding is delayed, suggesting high resistance and long contact time.",
+      "score_expr": "min(shot_time_s / 35.0 if shot_time_s > 0 else 0.0, 0.60 / max(1e-6, blond_rate) if blond_rate > 0 else 1.0, blond_60_norm / 0.60 if blond_60_norm is not None else 0.0)",
+      "when_expr": "shot_time_s >= 30.0 and ((blond_60_norm is not None and blond_60_norm >= 0.55) or blond_rate <= 0.05) and channel_mean_norm < 2.0 and flag_score('global_high_channeling_unstable_puck') < 0.95",
+      "reason": "The shot is long, blonding is delayed, and channeling is not the dominant issue.",
+      "evidence": {
+        "shot_time_s": "round(shot_time_s, 3)",
+        "blond_rate": "round4(blond_rate)",
+        "blond_60_norm": "round_or_none(blond_60_norm, 4)",
+        "channel_mean_norm": "round4(channel_mean_norm)"
+      }
+    },
+    {
+      "code": "uneven_extraction_long_high_channeling",
+      "title": "Uneven Extraction",
+      "category": "extraction",
+      "description": "The shot runs long while channeling remains elevated, pointing to uneven flow through the puck.",
+      "score_expr": "min(shot_time_s / 35.0 if shot_time_s > 0 else 0.0, channel_mean_norm / 2.0 if channel_mean_norm > 0 else 0.0, flag_score_max('localized_single_quadrant_channeling', 'one_sided_extraction_bias', 'global_high_channeling_unstable_puck'))",
+      "when_expr": "shot_time_s >= 30.0 and (channel_mean_norm >= 2.0 or channel_peak_norm >= 15.0) and flag_score_max('localized_single_quadrant_channeling', 'one_sided_extraction_bias', 'global_high_channeling_unstable_puck') >= 0.75",
+      "reason": "The shot runs long while channeling remains materially elevated.",
+      "evidence": {
+        "shot_time_s": "round(shot_time_s, 3)",
+        "channel_mean_norm": "round4(channel_mean_norm)",
+        "channel_peak_norm": "round4(channel_peak_norm)"
+      }
+    },
+    {
+      "code": "choked_restricted_flow",
+      "title": "Choked / Restricted Flow",
+      "category": "flow",
+      "description": "Flow appears restricted with a long shot, weak blonding progression, and low visible channeling.",
+      "score_expr": "min(shot_time_s / 35.0 if shot_time_s > 0 else 0.0, 1.0 / max(1e-6, channel_mean_norm + 1e-6), 0.35 / max(1e-6, blonding_change + 1e-6), max(0.25 / max(1e-6, flow_start_confidence + 1e-6), flow_start_s / 4.0))",
+      "when_expr": "shot_time_s > 35.0 and channel_mean_norm < 1.0 and blonding_change < 0.35 and (flow_start_confidence < 0.25 or flow_start_s >= 4.0)",
+      "reason": "The shot is long but the visible flow and blonding progression stay muted.",
+      "evidence": {
+        "shot_time_s": "round(shot_time_s, 3)",
+        "channel_mean_norm": "round4(channel_mean_norm)",
+        "blonding_change": "round4(blonding_change)",
+        "flow_start_confidence": "round4(flow_start_confidence)"
+      }
+    },
+    {
+      "code": "gushing_low_resistance_flow",
+      "title": "Gushing / Low Resistance Flow",
+      "category": "flow",
+      "description": "The shot runs quickly with strong blonding progression but without strong localised channeling.",
+      "score_expr": "min(18.0 / max(1e-6, shot_time_s) if shot_time_s > 0 else 0.0, blond_rate / 0.12 if blond_rate > 0 else 0.0, 2.0 / max(1e-6, channel_mean_norm + 1e-6))",
+      "when_expr": "shot_time_s < 18.0 and channel_mean_norm < 2.0 and blond_rate >= 0.12",
+      "reason": "The shot runs fast with strong blonding progression but without extreme localised channeling.",
+      "evidence": {
+        "shot_time_s": "round(shot_time_s, 3)",
+        "blond_rate": "round4(blond_rate)",
+        "channel_mean_norm": "round4(channel_mean_norm)"
+      }
+    },
+    {
+      "code": "dry_zone_dead_zone",
+      "title": "Dry-Zone / Dead-Zone Detection",
+      "category": "distribution",
+      "description": "One quadrant stays unusually quiet while the rest of the basket extracts more actively.",
+      "score_expr": "min(0.12 / max(1e-6, weakest_quadrant_share + 1e-6), 0.35 / max(1e-6, weakest_to_mean_other_ratio + 1e-6), channel_moderate_frame_ratio / 0.18 if channel_moderate_frame_ratio > 0 else 0.0)",
+      "when_expr": "weakest_quadrant_share <= 0.12 and weakest_to_mean_other_ratio <= 0.35 and channel_moderate_frame_ratio >= 0.18",
+      "reason": "One quadrant stays much quieter than the rest of the basket.",
+      "evidence": {
+        "weakest_quadrant": "weakest_quadrant",
+        "weakest_quadrant_share": "round4(weakest_quadrant_share)",
+        "weakest_to_mean_other_ratio": "round4(weakest_to_mean_other_ratio)"
+      }
+    }
+  ]
+}

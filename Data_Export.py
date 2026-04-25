@@ -5,6 +5,8 @@ import json
 import math
 import os
 
+from Espresso_Diagnostics import compute_diagnostics, flatten_diagnostic_features
+
 
 def _normalise_video_key(value):
     if value is None:
@@ -339,6 +341,7 @@ def build_event_row(result, label, frame_rows):
     channeling_spatial_summary = result.get("channeling_spatial_summary") or {}
     channeling_temporal_summary = result.get("channeling_temporal_summary") or {}
     quality = result.get("quality") or {}
+    diagnostics = result.get("diagnostics") or compute_diagnostics(result)
 
     event_row = {
         "video_id": video_id,
@@ -365,6 +368,7 @@ def build_event_row(result, label, frame_rows):
         "channel_burstiness": _as_float(channeling_temporal_summary.get("burstiness")),
         "channel_early_late_holes_delta": _as_float(channeling_temporal_summary.get("early_late_holes_delta")),
     }
+    event_row.update(flatten_diagnostic_features(diagnostics, prefix="diag"))
 
     for threshold in (0.2, 0.4, 0.6, 0.8):
         time_s, norm_t, frame_idx = _first_crossing(frame_rows, "blond_score", threshold)
@@ -412,6 +416,7 @@ def build_event_row(result, label, frame_rows):
 def build_summary_row(result, label, event_row=None):
     video_id = str(result.get("video_name", "unknown"))
     channel_stats = result.get("channeling_stats") or {}
+    diagnostics = result.get("diagnostics") or compute_diagnostics(result)
     flow_start = _as_int(result.get("flow_start"), 0)
     flow_end = _as_int(result.get("flow_end"), flow_start)
 
@@ -434,7 +439,7 @@ def build_summary_row(result, label, event_row=None):
     else:
         ch_coverage_norm = 0.5
 
-    return {
+    summary_row = {
         "video_id": video_id,
         "label": label if label is not None else "",
         "shot_time": shot_time,
@@ -461,6 +466,20 @@ def build_summary_row(result, label, event_row=None):
         "channel_global_tb_asymmetry": _as_float(event_row.get("channel_global_tb_asymmetry")) or 0.0,
         "channel_mean_spatial_entropy": _as_float(event_row.get("channel_mean_spatial_entropy")) or 0.0,
     }
+    summary_row.update(flatten_diagnostic_features(diagnostics, prefix="diag"))
+    return summary_row
+
+
+def _complete_fieldnames(preferred_fieldnames, rows):
+    extras = []
+    seen = set(preferred_fieldnames)
+    for row in rows:
+        for key in row.keys():
+            if key in seen:
+                continue
+            seen.add(key)
+            extras.append(key)
+    return list(preferred_fieldnames) + sorted(extras)
 
 
 def export_to_csv(analysis_dir, output_file="training_data.csv"):
@@ -632,17 +651,26 @@ def export_to_csv(analysis_dir, output_file="training_data.csv"):
 
     try:
         with open(timeseries_path, "w", newline="", encoding="utf-8") as file_ref:
-            writer = csv.DictWriter(file_ref, fieldnames=frame_fieldnames)
+            writer = csv.DictWriter(
+                file_ref,
+                fieldnames=_complete_fieldnames(frame_fieldnames, frame_rows_all),
+            )
             writer.writeheader()
             writer.writerows(frame_rows_all)
 
         with open(events_path, "w", newline="", encoding="utf-8") as file_ref:
-            writer = csv.DictWriter(file_ref, fieldnames=event_fieldnames)
+            writer = csv.DictWriter(
+                file_ref,
+                fieldnames=_complete_fieldnames(event_fieldnames, event_rows),
+            )
             writer.writeheader()
             writer.writerows(event_rows)
 
         with open(summary_path, "w", newline="", encoding="utf-8") as file_ref:
-            writer = csv.DictWriter(file_ref, fieldnames=summary_fieldnames)
+            writer = csv.DictWriter(
+                file_ref,
+                fieldnames=_complete_fieldnames(summary_fieldnames, summary_rows),
+            )
             writer.writeheader()
             writer.writerows(summary_rows)
 

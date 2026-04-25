@@ -5,6 +5,7 @@ import json
 from collections import deque
 from typing import Dict, Tuple, List
 from Portafilter_Detection import detect_elliptical_portafilter_with_holes
+from Espresso_Diagnostics import build_combined_assessment, compute_diagnostics
 
 # Helpers
 
@@ -2084,11 +2085,16 @@ def extract_features_from_video(cropped_frames_dir=None,
                 "min": int(np.min(channeling_array))
             }
 
+        diagnostics = compute_diagnostics(results_json)
+        results_json["diagnostics"] = diagnostics
+        colour_results["diagnostics"] = diagnostics
+
         flow_quality = flow_metrics or {}
         channel_quality = colour_results.get("channeling_quality") or {}
         overall_flags = []
         overall_flags.extend(flow_quality.get("quality_flags") or [])
         overall_flags.extend(channel_quality.get("flags") or [])
+        overall_flags.extend(diagnostics.get("flag_codes") or [])
         overall_flags = sorted(set(overall_flags))
         overall_score = float(np.clip(
             0.5 * float(flow_quality.get("quality_score", 0.0))
@@ -2101,8 +2107,31 @@ def extract_features_from_video(cropped_frames_dir=None,
             "flags": overall_flags,
             "flow_score": float(flow_quality.get("quality_score", 0.0)),
             "channeling_score": float(channel_quality.get("quality_score", 0.0)),
+            "diagnostic_flag_count": int(diagnostics.get("flag_count") or 0),
         }
         colour_results["quality"] = results_json["quality"]
+
+        model_prediction = None
+        try:
+            from Espresso_Model import default_model_path, predict_from_results_dict
+
+            if os.path.exists(default_model_path):
+                model_prediction = predict_from_results_dict(
+                    results_json,
+                    model_path=default_model_path,
+                )
+        except Exception as prediction_error:
+            print(f"Model prediction skipped: {prediction_error}")
+
+        results_json["model_prediction"] = model_prediction
+        colour_results["model_prediction"] = model_prediction
+
+        combined_assessment = build_combined_assessment(
+            diagnostics=diagnostics,
+            model_prediction=model_prediction,
+        )
+        results_json["combined_assessment"] = combined_assessment
+        colour_results["combined_assessment"] = combined_assessment
         
         os.makedirs(output_results_dir, exist_ok=True)
         json_output_path = os.path.join(output_results_dir, f"{video_name}_results.json")

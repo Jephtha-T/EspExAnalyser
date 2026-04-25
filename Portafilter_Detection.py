@@ -14,6 +14,23 @@ import matplotlib.patches as mpatches
 Base_Dir = os.path.dirname(os.path.abspath(__file__))
 Frame_Dir = os.path.join(Base_Dir, "Image Data/Frames")
 _YOLO_MODEL_CACHE = {"path": None, "model": None, "load_error": None}
+FAST_THRESHOLD_DEFAULT = 15
+FAST_MIN_CIRCULARITY_DEFAULT = 0.4
+FAST_SIZE_TOLERANCE_DEFAULT = 5
+DEBUG_IMAGE_ORDER = [
+    "Original",
+    "YOLO ROI",
+    "Sharpened",
+    "Blurred",
+    "Canny Edges",
+    "Change Mask (Blurred)",
+    "FAST Keypoints",
+    "Detected Features",
+    "Manual Ellipse",
+    "Ellipse Comparison",
+    "Final Result",
+    "Cropped Result",
+]
 
 
 def _resolve_portafilter_model_path(model_path=None):
@@ -915,6 +932,435 @@ def generate_change_mask(frame1, frame2, threshold=30):
 
     return mask
 
+
+def _resolve_manual_roi_selection(original_image, manual_roi, manual_ellipse):
+    resolved_manual_ellipse = _normalize_ellipse(manual_ellipse)
+
+    if manual_roi and resolved_manual_ellipse is None:
+        print("Manual ROI mode enabled. Please select the portafilter ellipse.")
+        resolved_manual_ellipse = select_manual_ellipse(original_image)
+        if resolved_manual_ellipse is None:
+            print("Manual ROI selection cancelled; falling back to automatic detection.")
+
+    return resolved_manual_ellipse
+
+
+def _apply_yolo_prefilter_if_enabled(
+    original_image,
+    second_frame,
+    manual_ellipse,
+    manual_roi,
+    use_yolo_prefilter,
+    yolo_model_path,
+    yolo_conf,
+    yolo_iou,
+    yolo_padding_ratio,
+    debug_images,
+):
+    image = original_image
+    roi_offset = (0, 0)
+    yolo_bbox = None
+
+    if not use_yolo_prefilter or manual_ellipse is not None or manual_roi:
+        return image, second_frame, roi_offset, yolo_bbox
+
+    yolo_bbox, yolo_score = detect_portafilter_bbox_yolo(
+        original_image,
+        model_path=yolo_model_path,
+        conf=yolo_conf,
+        iou=yolo_iou,
+        padding_ratio=yolo_padding_ratio,
+    )
+    if yolo_bbox is None:
+        print("YOLO prefilter not available or no detection found; using full frame.")
+        return image, second_frame, roi_offset, yolo_bbox
+
+    x1, y1, x2, y2 = yolo_bbox
+    roi_offset = (x1, y1)
+    image = original_image[y1:y2, x1:x2].copy()
+    if second_frame is not None:
+        if second_frame.shape[0] >= y2 and second_frame.shape[1] >= x2:
+            second_frame = second_frame[y1:y2, x1:x2].copy()
+        else:
+            second_frame = None
+            print("Second frame is smaller than YOLO ROI bounds; skipping change-mask assist.")
+
+    yolo_overlay = original_image.copy()
+    cv2.rectangle(yolo_overlay, (x1, y1), (x2, y2), (0, 255, 255), 2)
+    cv2.putText(
+        yolo_overlay,
+        f"YOLO ROI conf={yolo_score:.2f}",
+        (x1, max(20, y1 - 10)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 255),
+        2,
+    )
+    debug_images["YOLO ROI"] = yolo_overlay
+    print(f"Using YOLO prefilter ROI: {(x1, y1, x2, y2)} (conf={yolo_score:.3f})")
+    return image, second_frame, roi_offset, yolo_bbox
+
+
+def _prepare_detection_context(image):
+    output = image.copy()
+    output2 = image.copy()
+
+    lap_var = cv2.Laplacian(image, cv2.CV_64F).var()
+    print(f"Laplacian variance: {lap_var:.2f}")
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    frame_h, frame_w = gray.shape[:2]
+    frame_area = float(frame_h * frame_w)
+
+    return {
+        "output": output,
+        "output2": output2,
+        "gray": gray,
+        "min_area_auto": max(1200.0, frame_area * 0.025),
+        "min_area_mask": max(900.0, frame_area * 0.012),
+        "min_axis_len": max(10.0, min(frame_h, frame_w) * 0.05),
+    }
+
+
+def _extract_change_mask_candidates(image, second_frame, mask_threshold, min_area_mask, min_axis_len, debug_images):
+    if second_frame is None:
+        return [], []
+
+    try:
+        change_mask = generate_change_mask(image, second_frame, threshold=mask_threshold)
+        change_mask_blurred = cv2.GaussianBlur(change_mask, (11, 11), 0)
+        debug_images["Change Mask (Blurred)"] = change_mask_blurred
+
+        try:
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+            cleaned_mask = cv2.morphologyEx(change_mask, cv2.MORPH_CLOSE, kernel_close)
+            return _extract_ellipse_candidates_from_binary(
+                cleaned_mask,
+                min_area=min_area_mask,
+                min_axis=min_axis_len,
+                max_aspect=8.0,
+            )
+        except Exception as exc:
+            print(f"Failed to detect ellipses from change mask: {exc}")
+            return [], []
+    except Exception as exc:
+        print(f"Failed to generate change mask: {exc}")
+        return [], []
+
+
+def _extract_fast_feature_data(image, gray, debug_images):
+    fast_keypoints, keypoint_sizes = detect_fast_circles(
+        gray,
+        threshold=FAST_THRESHOLD_DEFAULT,
+        min_circularity=FAST_MIN_CIRCULARITY_DEFAULT,
+    )
+
+    mode_size = find_mode_size(keypoint_sizes, tolerance=FAST_SIZE_TOLERANCE_DEFAULT)
+    mode_keypoints = (
+        filter_keypoints_by_size(
+            fast_keypoints,
+            keypoint_sizes,
+            mode_size,
+            tolerance=FAST_SIZE_TOLERANCE_DEFAULT,
+        )
+        if mode_size is not None
+        else fast_keypoints
+    )
+
+    print(f"Found {len(fast_keypoints)} FAST keypoints")
+
+    debug_output = image.copy()
+    cv2.drawKeypoints(
+        debug_output,
+        fast_keypoints,
+        debug_output,
+        color=(0, 255, 255),
+        flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS,
+    )
+    debug_images["FAST Keypoints"] = debug_output
+
+    fast_params = {
+        "threshold": FAST_THRESHOLD_DEFAULT,
+        "min_circularity": FAST_MIN_CIRCULARITY_DEFAULT,
+        "size_tolerance": FAST_SIZE_TOLERANCE_DEFAULT,
+        "mode_size": mode_size,
+    }
+    return fast_keypoints, mode_size, mode_keypoints, fast_params
+
+
+def _build_candidate_edge_maps(gray, debug_images):
+    el_gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    debug_images["Blurred"] = el_gray
+
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    el_edges = cv2.Canny(el_gray, 90, 180, apertureSize=3)
+    debug_images["Canny Edges"] = edges
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    el_edges_alt = cv2.Canny(clahe, 70, 160, apertureSize=3)
+    el_edges_light = cv2.Canny(gray, 60, 150, apertureSize=3)
+
+    candidate_edge_map = cv2.bitwise_or(el_edges, el_edges_alt)
+    candidate_edge_map = cv2.bitwise_or(candidate_edge_map, el_edges_light)
+    candidate_edge_map = cv2.morphologyEx(
+        candidate_edge_map,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    )
+    debug_images["Ellipse Candidate Edges"] = candidate_edge_map
+    return edges, candidate_edge_map
+
+
+def _draw_hough_segments(output, edges, max_segment_length=50):
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=20, maxLineGap=10)
+    if lines is None:
+        return
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        dx = x2 - x1
+        dy = y2 - y1
+        length = np.hypot(dx, dy)
+
+        if length <= max_segment_length:
+            cv2.line(output, (x1, y1), (x2, y2), (0, 255, 0), 1)
+            continue
+
+        num_segments = int(np.ceil(length / max_segment_length))
+        for i in range(num_segments):
+            t1 = i / num_segments
+            t2 = (i + 1) / num_segments
+            sx1 = int(x1 + t1 * dx)
+            sy1 = int(y1 + t1 * dy)
+            sx2 = int(x1 + t2 * dx)
+            sy2 = int(y1 + t2 * dy)
+            cv2.line(output, (sx1, sy1), (sx2, sy2), (0, 255, 0), 1)
+
+
+def _draw_fast_keypoints_overlay(output, fast_keypoints):
+    for kp in fast_keypoints:
+        x, y = int(kp.pt[0]), int(kp.pt[1])
+        cv2.circle(output, (x, y), 3, (255, 0, 0), -1)
+
+
+def _append_candidate_ellipse(ellipses, areas, output, ellipse, area, color, thickness, message=None):
+    if not _append_unique_ellipse(ellipses, areas, ellipse, area):
+        return False
+    safe_draw_ellipse(output, ellipse, color, thickness)
+    if message:
+        print(message)
+    return True
+
+
+def _collect_ellipse_candidates(
+    image,
+    output,
+    manual_ellipse,
+    yolo_bbox,
+    candidate_edge_map,
+    min_area_auto,
+    min_axis_len,
+    mask_ellipses,
+    mask_areas,
+    debug_images,
+):
+    ellipses = []
+    areas = []
+
+    if manual_ellipse is not None:
+        safe_draw_ellipse(output, manual_ellipse, (0, 255, 255), 2)
+        debug_images["Manual Ellipse"] = output.copy()
+        return ellipses, areas
+
+    if yolo_bbox is not None:
+        forced_bbox_ellipse = _ellipse_from_roi_bounds(
+            image.shape,
+            pad_ratio_x=0.08,
+            pad_ratio_y=0.10,
+        )
+        if forced_bbox_ellipse is not None:
+            forced_area = float(forced_bbox_ellipse[1][0] * forced_bbox_ellipse[1][1] * np.pi)
+            _append_candidate_ellipse(
+                ellipses,
+                areas,
+                output,
+                forced_bbox_ellipse,
+                forced_area,
+                (255, 255, 0),
+                2,
+                message="Added forced bbox-derived ellipse candidate.",
+            )
+
+    edge_ellipses, edge_areas = _extract_ellipse_candidates_from_binary(
+        candidate_edge_map,
+        min_area=min_area_auto,
+        min_axis=min_axis_len,
+        max_aspect=8.0,
+    )
+    for ellipse, area in zip(edge_ellipses, edge_areas):
+        _append_candidate_ellipse(ellipses, areas, output, ellipse, area, (0, 0, 255), 1)
+
+    for mask_ellipse, mask_area in zip(mask_ellipses, mask_areas):
+        _append_candidate_ellipse(ellipses, areas, output, mask_ellipse, mask_area, (0, 255, 0), 1)
+
+    return ellipses, areas
+
+
+def _select_best_ellipse(image, manual_ellipse, ellipses, areas, fast_keypoints):
+    if manual_ellipse is not None:
+        print("Using manually selected ellipse.")
+        return manual_ellipse
+
+    print("Evaluating ellipses with FAST features")
+    best_ellipse = ellipse_feature_score(
+        image,
+        ellipses,
+        areas,
+        fast_keypoints=fast_keypoints,
+        min_area=500,
+    )
+    if best_ellipse is None and len(ellipses) > 0:
+        print("WARNING: No high-score ellipse found - using largest fallback ellipse.")
+        best_ellipse = max(ellipses, key=lambda el: el[1][0] * el[1][1])
+    return best_ellipse
+
+
+def _build_detected_features_view(output, best_ellipse):
+    detected_features_view = output.copy()
+    if best_ellipse is None:
+        return detected_features_view
+
+    safe_draw_ellipse(detected_features_view, best_ellipse, (255, 0, 255), 4)
+    (sel_cx, sel_cy), _, _ = best_ellipse
+    cv2.putText(
+        detected_features_view,
+        "Selected",
+        (int(sel_cx) - 35, max(18, int(sel_cy) - 14)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 0, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return detected_features_view
+
+
+def _collect_keypoints_inside_best_ellipse(image_shape, best_ellipse, mode_keypoints, fast_keypoints):
+    if best_ellipse is None:
+        return []
+
+    best_mask = np.zeros((image_shape[0], image_shape[1]), dtype=np.uint8)
+    cv2.ellipse(best_mask, best_ellipse, 255, -1)
+
+    best_ellipse_keypoints = []
+    final_keypoints = mode_keypoints if mode_keypoints else fast_keypoints
+    for kp in final_keypoints:
+        x, y = int(kp.pt[0]), int(kp.pt[1])
+        if 0 <= y < image_shape[0] and 0 <= x < image_shape[1] and best_mask[y, x] == 255:
+            best_ellipse_keypoints.append(kp)
+    return best_ellipse_keypoints
+
+
+def _render_final_result_overlay(output2, best_ellipse, best_ellipse_keypoints):
+    if best_ellipse is None:
+        return output2
+
+    if len(best_ellipse_keypoints) > 0:
+        cv2.drawKeypoints(
+            output2,
+            best_ellipse_keypoints,
+            output2,
+            color=(255, 0, 255),
+            flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS,
+        )
+        safe_draw_ellipse(output2, best_ellipse, (255, 0, 255), 15)
+        (cx, cy), _, _ = best_ellipse
+        cv2.putText(
+            output2,
+            f"FAST: {len(best_ellipse_keypoints)}",
+            (int(cx - 50), int(cy - 50)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (255, 255, 255),
+            2,
+        )
+        print(f"Best ellipse contains {len(best_ellipse_keypoints)} FAST keypoints")
+        return output2
+
+    safe_draw_ellipse(output2, best_ellipse, (255, 0, 255), 15)
+    return output2
+
+
+def _is_same_ellipse_exact(e1, e2, tol=1e-1):
+    if e1 is None or e2 is None:
+        return False
+    return (
+        abs(e1[0][0] - e2[0][0]) < tol and
+        abs(e1[0][1] - e2[0][1]) < tol and
+        abs(e1[1][0] - e2[1][0]) < tol and
+        abs(e1[1][1] - e2[1][1]) < tol
+    )
+
+
+def _build_ellipse_comparison_view(image, ellipses, mask_ellipses, best_ellipse, mode_keypoints):
+    comparison_img = image.copy()
+    for ellipse in ellipses:
+        is_mask = any(_is_same_ellipse_exact(ellipse, mask_ellipse) for mask_ellipse in mask_ellipses)
+        is_best = _is_same_ellipse_exact(ellipse, best_ellipse)
+        if is_mask:
+            color, thickness = (0, 255, 0), 3
+        elif is_best:
+            color, thickness = (0, 255, 255), 3
+        else:
+            color, thickness = (0, 0, 255), 1
+        safe_draw_ellipse(comparison_img, ellipse, color, thickness)
+
+        ellipse_count = count_keypoints_in_ellipse(ellipse, mode_keypoints, image.shape)
+        (cx, cy), _, _ = ellipse
+        cv2.putText(
+            comparison_img,
+            f"{ellipse_count}",
+            (int(cx - 20), int(cy)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+        )
+    return comparison_img
+
+
+def _restore_full_frame_result(output2, original_image, yolo_bbox):
+    if yolo_bbox is None:
+        return output2
+
+    x1, y1, x2, y2 = yolo_bbox
+    full_result = original_image.copy()
+    target_h = max(1, y2 - y1)
+    target_w = max(1, x2 - x1)
+    patch = output2
+    if patch.shape[0] != target_h or patch.shape[1] != target_w:
+        patch = cv2.resize(patch, (target_w, target_h))
+    full_result[y1:y2, x1:x2] = patch
+    cv2.rectangle(full_result, (x1, y1), (x2, y2), (0, 255, 255), 2)
+    return full_result
+
+
+def _order_debug_images(debug_images):
+    ordered_debug_images = {}
+    for key in DEBUG_IMAGE_ORDER:
+        if key in debug_images:
+            ordered_debug_images[key] = debug_images[key]
+    return ordered_debug_images
+
+
+def _render_debug_dashboard_if_requested(ordered_debug_images, save_dashboard, use_interactive, dashboard_path):
+    if not save_dashboard:
+        return
+    if use_interactive:
+        create_interactive_dashboard(ordered_debug_images)
+    else:
+        create_debug_dashboard(ordered_debug_images, save_path=dashboard_path)
+
 def detect_elliptical_portafilter_with_holes(
     image,
     save_dashboard=False,
@@ -934,394 +1380,104 @@ def detect_elliptical_portafilter_with_holes(
     if image is None:
         print(f"Error loading image: {image}")
         return None
-    
-    original_image = image.copy()
 
-    # Dictionary to store all intermediary steps for dashboard
+    original_image = image.copy()
     debug_images = {}
     debug_images["Original"] = original_image.copy()
 
-    manual_ellipse = _normalize_ellipse(manual_ellipse)
-
-    if manual_roi and manual_ellipse is None:
-        print("Manual ROI mode enabled. Please select the portafilter ellipse.")
-        manual_ellipse = select_manual_ellipse(original_image)
-        if manual_ellipse is None:
-            print("Manual ROI selection cancelled; falling back to automatic detection.")
-
-    roi_offset = (0, 0)
-    yolo_bbox = None
-    if use_yolo_prefilter and manual_ellipse is None and not manual_roi:
-        yolo_bbox, yolo_score = detect_portafilter_bbox_yolo(
-            original_image,
-            model_path=yolo_model_path,
-            conf=yolo_conf,
-            iou=yolo_iou,
-            padding_ratio=yolo_padding_ratio,
-        )
-        if yolo_bbox is not None:
-            x1, y1, x2, y2 = yolo_bbox
-            roi_offset = (x1, y1)
-            image = original_image[y1:y2, x1:x2].copy()
-            if second_frame is not None:
-                if second_frame.shape[0] >= y2 and second_frame.shape[1] >= x2:
-                    second_frame = second_frame[y1:y2, x1:x2].copy()
-                else:
-                    second_frame = None
-                    print("Second frame is smaller than YOLO ROI bounds; skipping change-mask assist.")
-
-            yolo_overlay = original_image.copy()
-            cv2.rectangle(yolo_overlay, (x1, y1), (x2, y2), (0, 255, 255), 2)
-            cv2.putText(
-                yolo_overlay,
-                f"YOLO ROI conf={yolo_score:.2f}",
-                (x1, max(20, y1 - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 255),
-                2,
-            )
-            debug_images["YOLO ROI"] = yolo_overlay
-            print(f"Using YOLO prefilter ROI: {(x1, y1, x2, y2)} (conf={yolo_score:.3f})")
-        else:
-            print("YOLO prefilter not available or no detection found; using full frame.")
-
-    output = image.copy()
-    output2 = image.copy()
-    debug_output = image.copy()  # For showing FAST evaluation process
-
-    # Check if image is too sharp or too blurry
-    lap_var = cv2.Laplacian(image, cv2.CV_64F).var()
-    print(f"Laplacian variance: {lap_var:.2f}")
-
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    frame_h, frame_w = gray.shape[:2]
-    frame_area = float(frame_h * frame_w)
-
-    # Scale ellipse filters to the current frame/ROI size so cropped YOLO regions
-    # and full-frame fallback both behave consistently.
-    min_area_auto = max(1200.0, frame_area * 0.025)
-    min_area_mask = max(900.0, frame_area * 0.012)
-    min_axis_len = max(10.0, min(frame_h, frame_w) * 0.05)
-
-    #  Change Mask between first frame (image) and provided second_frame 
-    if second_frame is not None:
-        try:
-            change_mask = generate_change_mask(image, second_frame, threshold=mask_threshold)
-            change_mask_blurred = cv2.GaussianBlur(change_mask, (11, 11), 0)
-            debug_images["Change Mask (Blurred)"] = change_mask_blurred
-
-            # Detect ellipses from the change mask
-            try:
-                # Morph close to connect regions for more stable contours
-                kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-                cleaned_mask = cv2.morphologyEx(change_mask, cv2.MORPH_CLOSE, kernel_close)
-
-                mask_ellipses, mask_areas = _extract_ellipse_candidates_from_binary(
-                    cleaned_mask,
-                    min_area=min_area_mask,
-                    min_axis=min_axis_len,
-                    max_aspect=8.0,
-                )
-            except Exception as e:
-                print(f"Failed to detect ellipses from change mask: {e}")
-                mask_ellipses = []
-                mask_areas = []
-        except Exception as e:
-            print(f"Failed to generate change mask: {e}")
-            mask_ellipses = []
-            mask_areas = []
-    else:
-        mask_ellipses = []
-        mask_areas = []
-
-    # Store FAST detection parameters for consistency in feature extraction
-    FAST_THRESHOLD = 15
-    FAST_MIN_CIRCULARITY = 0.4
-    FAST_SIZE_TOLERANCE = 5
-    
-    fast_keypoints, keypoint_sizes = detect_fast_circles(gray, threshold=FAST_THRESHOLD, min_circularity=FAST_MIN_CIRCULARITY)
-    
-    # Keep all FAST keypoints for scoring, and keep mode-size points for the
-    # final best-ellipse preview.
-    mode_size = find_mode_size(keypoint_sizes, tolerance=FAST_SIZE_TOLERANCE)
-    mode_keypoints = (
-        filter_keypoints_by_size(
-            fast_keypoints,
-            keypoint_sizes,
-            mode_size,
-            tolerance=FAST_SIZE_TOLERANCE,
-        )
-        if mode_size is not None
-        else fast_keypoints
+    manual_ellipse = _resolve_manual_roi_selection(original_image, manual_roi, manual_ellipse)
+    image, second_frame, roi_offset, yolo_bbox = _apply_yolo_prefilter_if_enabled(
+        original_image=original_image,
+        second_frame=second_frame,
+        manual_ellipse=manual_ellipse,
+        manual_roi=manual_roi,
+        use_yolo_prefilter=use_yolo_prefilter,
+        yolo_model_path=yolo_model_path,
+        yolo_conf=yolo_conf,
+        yolo_iou=yolo_iou,
+        yolo_padding_ratio=yolo_padding_ratio,
+        debug_images=debug_images,
     )
 
-    print(f"Found {len(fast_keypoints)} FAST keypoints")
+    detection_context = _prepare_detection_context(image)
+    output = detection_context["output"]
+    output2 = detection_context["output2"]
+    gray = detection_context["gray"]
+    min_area_auto = detection_context["min_area_auto"]
+    min_area_mask = detection_context["min_area_mask"]
+    min_axis_len = detection_context["min_axis_len"]
 
-    # Draw all FAST keypoints on debug output
-    cv2.drawKeypoints(debug_output, fast_keypoints, debug_output, color=(0, 255, 255),
-                    flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-    debug_images["FAST Keypoints"] = debug_output
-
-    # Blurred image ONLY for Portafilter Ellipse Detection (not for feature detection)
-    el_gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    debug_images["Blurred"] = el_gray
-
-    # Edge detection
-    # Use original/sharpened image for Hough line detection
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-    # Use blurred image ONLY for ellipse detection
-    el_edges = cv2.Canny(el_gray, 90, 180, apertureSize=3)
-    debug_images["Canny Edges"] = edges
-
-    # Additional edge maps improve ellipse candidate recall under varying lighting.
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-    el_edges_alt = cv2.Canny(clahe, 70, 160, apertureSize=3)
-    el_edges_light = cv2.Canny(gray, 60, 150, apertureSize=3)
-
-    candidate_edge_map = cv2.bitwise_or(el_edges, el_edges_alt)
-    candidate_edge_map = cv2.bitwise_or(candidate_edge_map, el_edges_light)
-    candidate_edge_map = cv2.morphologyEx(
-        candidate_edge_map,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    mask_ellipses, mask_areas = _extract_change_mask_candidates(
+        image=image,
+        second_frame=second_frame,
+        mask_threshold=mask_threshold,
+        min_area_mask=min_area_mask,
+        min_axis_len=min_axis_len,
+        debug_images=debug_images,
     )
-    debug_images["Ellipse Candidate Edges"] = candidate_edge_map
+    fast_keypoints, mode_size, mode_keypoints, fast_params = _extract_fast_feature_data(
+        image=image,
+        gray=gray,
+        debug_images=debug_images,
+    )
 
-    #  1. Hough Line Detection
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=20, maxLineGap=10)
-    max_segment_length = 50  # Maximum length per segment in pixels
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
+    edges, candidate_edge_map = _build_candidate_edge_maps(gray, debug_images)
+    _draw_hough_segments(output, edges)
+    _draw_fast_keypoints_overlay(output, fast_keypoints)
 
-            # Compute total line length and direction
-            dx = x2 - x1
-            dy = y2 - y1
-            length = np.hypot(dx, dy)
+    ellipses, areas = _collect_ellipse_candidates(
+        image=image,
+        output=output,
+        manual_ellipse=manual_ellipse,
+        yolo_bbox=yolo_bbox,
+        candidate_edge_map=candidate_edge_map,
+        min_area_auto=min_area_auto,
+        min_axis_len=min_axis_len,
+        mask_ellipses=mask_ellipses,
+        mask_areas=mask_areas,
+        debug_images=debug_images,
+    )
+    best_ellipse = _select_best_ellipse(
+        image=image,
+        manual_ellipse=manual_ellipse,
+        ellipses=ellipses,
+        areas=areas,
+        fast_keypoints=fast_keypoints,
+    )
 
-            if length <= max_segment_length:
-                # Line is short enough — draw as is
-                cv2.line(output, (x1, y1), (x2, y2), (0, 255, 0), 1)
-            else:
-                # Break line into smaller segments
-                num_segments = int(np.ceil(length / max_segment_length))
-                for i in range(num_segments):
-                    t1 = i / num_segments
-                    t2 = (i + 1) / num_segments
-                    sx1 = int(x1 + t1 * dx)
-                    sy1 = int(y1 + t1 * dy)
-                    sx2 = int(x1 + t2 * dx)
-                    sy2 = int(y1 + t2 * dy)
-                    cv2.line(output, (sx1, sy1), (sx2, sy2), (0, 255, 0), 1)
+    debug_images["Detected Features"] = _build_detected_features_view(output, best_ellipse)
+    best_ellipse_keypoints = _collect_keypoints_inside_best_ellipse(
+        image_shape=image.shape,
+        best_ellipse=best_ellipse,
+        mode_keypoints=mode_keypoints,
+        fast_keypoints=fast_keypoints,
+    )
+    output2 = _render_final_result_overlay(output2, best_ellipse, best_ellipse_keypoints)
 
-    # Draw filtered keypoints on output
-    for kp in fast_keypoints:
-        x, y = int(kp.pt[0]), int(kp.pt[1])
-        cv2.circle(output, (x, y), 3, (255, 0, 0), -1)  # Draw small circles
-
-    ellipses = []
-    areas = []
-    if manual_ellipse is None:
-        if yolo_bbox is not None:
-            forced_bbox_ellipse = _ellipse_from_roi_bounds(
-                image.shape,
-                pad_ratio_x=0.08,
-                pad_ratio_y=0.10,
-            )
-            if forced_bbox_ellipse is not None:
-                forced_area = float(forced_bbox_ellipse[1][0] * forced_bbox_ellipse[1][1] * np.pi)
-                if _append_unique_ellipse(ellipses, areas, forced_bbox_ellipse, forced_area):
-                    safe_draw_ellipse(output, forced_bbox_ellipse, (255, 255, 0), 2)
-                    print("Added forced bbox-derived ellipse candidate.")
-
-        # 3. Ellipse detection from a combined edge map for better recall.
-        edge_ellipses, edge_areas = _extract_ellipse_candidates_from_binary(
-            candidate_edge_map,
-            min_area=min_area_auto,
-            min_axis=min_axis_len,
-            max_aspect=8.0,
-        )
-        for ellipse, area in zip(edge_ellipses, edge_areas):
-            if _append_unique_ellipse(ellipses, areas, ellipse, area):
-                safe_draw_ellipse(output, ellipse, (0, 0, 255), 1)
-
-        # Merge in mask-derived ellipses
-        for m_el, m_area in zip(mask_ellipses, mask_areas):
-            if _append_unique_ellipse(ellipses, areas, m_el, m_area):
-                safe_draw_ellipse(output, m_el, (0, 255, 0), 1)
-    else:
-        safe_draw_ellipse(output, manual_ellipse, (0, 255, 255), 2)
-        debug_images["Manual Ellipse"] = output.copy()
-
-    # Step 4: Score and highlight best ellipse with FAST features
-    if manual_ellipse is not None:
-        best_ellipse = manual_ellipse
-        print("Using manually selected ellipse.")
-    else:
-        print("Evaluating ellipses with FAST features")
-        best_ellipse = ellipse_feature_score(
-            image,
-            ellipses,
-            areas,
-            fast_keypoints=fast_keypoints,
-            min_area=500,
-        )
-        if best_ellipse is None and len(ellipses) > 0:
-            print("WARNING: No high-score ellipse found - using largest fallback ellipse.")
-            best_ellipse = max(
-                ellipses,
-                key=lambda el: el[1][0] * el[1][1]  # selects by width × height
-            )
-
-    detected_features_view = output.copy()
-    if best_ellipse is not None:
-        safe_draw_ellipse(detected_features_view, best_ellipse, (255, 0, 255), 4)
-        (sel_cx, sel_cy), _, _ = best_ellipse
-        cv2.putText(
-            detected_features_view,
-            "Selected",
-            (int(sel_cx) - 35, max(18, int(sel_cy) - 14)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-    debug_images["Detected Features"] = detected_features_view
-    
-    # Create visualization showing FAST keypoints within the best ellipse
-    best_ellipse_keypoints = []
-    if best_ellipse is not None:
-        best_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-        cv2.ellipse(best_mask, best_ellipse, 255, -1)
-
-        # Final overlay uses mode-sized points inside the chosen ellipse.
-        final_keypoints = mode_keypoints if mode_keypoints else fast_keypoints
-        for kp in final_keypoints:
-            x, y = int(kp.pt[0]), int(kp.pt[1])
-            if 0 <= y < image.shape[0] and 0 <= x < image.shape[1] and best_mask[y, x] == 255:
-                best_ellipse_keypoints.append(kp)
-
-    if best_ellipse is not None and len(best_ellipse_keypoints) > 0:
-
-        # Keep the final preview focused: only the final ellipse and interior keypoints.
-        cv2.drawKeypoints(output2, best_ellipse_keypoints, output2, color=(255, 0, 255), 
-                          flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-        safe_draw_ellipse(output2, best_ellipse, (255, 0, 255), 15)
-
-        (cx, cy), (major, minor), angle = best_ellipse
-        cv2.putText(output2, f"FAST: {len(best_ellipse_keypoints)}", 
-                    (int(cx-50), int(cy-50)), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        
-        print(f"Best ellipse contains {len(best_ellipse_keypoints)} FAST keypoints")
-
-    if best_ellipse is not None and len(best_ellipse_keypoints) == 0:
-        # Fallback view when keypoints are not available: show only the selected final ellipse.
-        safe_draw_ellipse(output2, best_ellipse, (255, 0, 255), 15)
-    
-    # Show comparison only when dashboard/debug visualisation is requested.
     if save_dashboard and best_ellipse is not None and len(best_ellipse_keypoints) > 0:
-        def is_same_ellipse(e1, e2, tol=1e-1):
-            if e1 is None or e2 is None:
-                return False
-            return (
-                abs(e1[0][0] - e2[0][0]) < tol and
-                abs(e1[0][1] - e2[0][1]) < tol and
-                abs(e1[1][0] - e2[1][0]) < tol and
-                abs(e1[1][1] - e2[1][1]) < tol
-            )
-
-        comparison_img = image.copy()
-        for ellipse in ellipses:
-            is_mask = any(is_same_ellipse(ellipse, m_el) for m_el in mask_ellipses)
-            is_best = is_same_ellipse(ellipse, best_ellipse)
-            if is_mask:
-                color, thickness = (0, 255, 0), 3
-            elif is_best:
-                color, thickness = (0, 255, 255), 3
-            else:
-                color, thickness = (0, 0, 255), 1
-            safe_draw_ellipse(comparison_img, ellipse, color, thickness)
-
-            # Count FAST points in this ellipse once per ellipse.
-            ellipse_count = count_keypoints_in_ellipse(ellipse, mode_keypoints, image.shape)
-            (cx, cy), _, _ = ellipse
-            cv2.putText(
-                comparison_img,
-                f"{ellipse_count}",
-                (int(cx - 20), int(cy)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                1,
-            )
-
-        debug_images["Ellipse Comparison"] = comparison_img
+        debug_images["Ellipse Comparison"] = _build_ellipse_comparison_view(
+            image=image,
+            ellipses=ellipses,
+            mask_ellipses=mask_ellipses,
+            best_ellipse=best_ellipse,
+            mode_keypoints=mode_keypoints,
+        )
 
     best_ellipse_full = _offset_ellipse(best_ellipse, roi_offset)
-
-    if yolo_bbox is not None:
-        x1, y1, x2, y2 = yolo_bbox
-        full_result = original_image.copy()
-        target_h = max(1, y2 - y1)
-        target_w = max(1, x2 - x1)
-        patch = output2
-        if patch.shape[0] != target_h or patch.shape[1] != target_w:
-            patch = cv2.resize(patch, (target_w, target_h))
-        full_result[y1:y2, x1:x2] = patch
-        cv2.rectangle(full_result, (x1, y1), (x2, y2), (0, 255, 255), 2)
-        output2 = full_result
+    output2 = _restore_full_frame_result(output2, original_image, yolo_bbox)
 
     debug_images["Final Result"] = output2
-    
-    # Use original image for final cropping (not sharpened or blurred)
     cropped_img = crop_image_by_ellipse(original_image, best_ellipse_full)
     debug_images["Cropped Result"] = cropped_img
 
-    # Reorder debug images for better slideshow flow.
-    ordered_debug_images = {}
-    
-    # Add images in desired order
-    if "Original" in debug_images:
-        ordered_debug_images["Original"] = debug_images["Original"]
-    if "YOLO ROI" in debug_images:
-        ordered_debug_images["YOLO ROI"] = debug_images["YOLO ROI"]
-    if "Sharpened" in debug_images:
-        ordered_debug_images["Sharpened"] = debug_images["Sharpened"]
-    if "Blurred" in debug_images:
-        ordered_debug_images["Blurred"] = debug_images["Blurred"]
-    if "Canny Edges" in debug_images:
-        ordered_debug_images["Canny Edges"] = debug_images["Canny Edges"]
-    if "Change Mask (Blurred)" in debug_images:
-        ordered_debug_images["Change Mask (Blurred)"] = debug_images["Change Mask (Blurred)"]
-    if "FAST Keypoints" in debug_images:
-        ordered_debug_images["FAST Keypoints"] = debug_images["FAST Keypoints"]
-    if "Detected Features" in debug_images:
-        ordered_debug_images["Detected Features"] = debug_images["Detected Features"]
-    if "Manual Ellipse" in debug_images:
-        ordered_debug_images["Manual Ellipse"] = debug_images["Manual Ellipse"]
-    if "Ellipse Comparison" in debug_images:
-        ordered_debug_images["Ellipse Comparison"] = debug_images["Ellipse Comparison"]
-    if "Final Result" in debug_images:
-        ordered_debug_images["Final Result"] = debug_images["Final Result"]
-    if "Cropped Result" in debug_images:
-        ordered_debug_images["Cropped Result"] = debug_images["Cropped Result"]
-    # Only show dashboards if saving or explicitly requested
-    if save_dashboard:
-        if use_interactive:
-            create_interactive_dashboard(ordered_debug_images)
-        else:
-            create_debug_dashboard(ordered_debug_images, save_path=dashboard_path)
+    ordered_debug_images = _order_debug_images(debug_images)
+    _render_debug_dashboard_if_requested(
+        ordered_debug_images=ordered_debug_images,
+        save_dashboard=save_dashboard,
+        use_interactive=use_interactive,
+        dashboard_path=dashboard_path,
+    )
 
-    # Return FAST detection parameters for consistency in feature extraction.
-    fast_params = {
-        'threshold': FAST_THRESHOLD,
-        'min_circularity': FAST_MIN_CIRCULARITY,
-        'size_tolerance': FAST_SIZE_TOLERANCE,
-        'mode_size': mode_size
-    }
-    
     if return_debug:
         return output2, best_ellipse_full, mode_size, fast_params, ordered_debug_images
     return output2, best_ellipse_full, mode_size, fast_params
@@ -1375,3 +1531,4 @@ if __name__ == "__main__":
             #cv2.destroyAllWindows()
         else:
             print("Failed to detect portafilter")
+

@@ -124,6 +124,13 @@ class EspressoAnalysisApp:
         self.canvas_widget = None
         self._manual_scroll_canvas = None
         self._manual_wheel_bound = False
+        self.canvas = None
+        self.rect_id = None
+        self.oval_id = None
+        self.manual_state = {}
+        self.manual_draw_image = None
+        self.manual_scale_x = 1.0
+        self.manual_scale_y = 1.0
 
         self.control_frame = None
         self.log_box = None
@@ -281,6 +288,352 @@ class EspressoAnalysisApp:
         self.root.unbind_all("<Button-5>")
         self._manual_wheel_bound = False
 
+    def _start_background_task(self, target, *args):
+        threading.Thread(
+            target=target,
+            args=args,
+            daemon=True,
+        ).start()
+
+    def _create_scrollable_container(self, parent, bind_local_wheel=False):
+        canvas = tk.Canvas(parent, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = ttk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _sync_scroll(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        inner.bind("<Configure>", _sync_scroll)
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(inner_id, width=event.width),
+        )
+
+        if bind_local_wheel:
+            canvas.bind("<MouseWheel>", self._on_manual_mousewheel)
+            canvas.bind("<Button-4>", self._on_manual_mousewheel_up)
+            canvas.bind("<Button-5>", self._on_manual_mousewheel_down)
+
+        return canvas, scrollbar, inner
+
+    def _create_review_fallback_tile(self, parent, label_text, tile_w, tile_h):
+        holder = ttk.Frame(parent, width=tile_w, height=tile_h)
+        holder.pack_propagate(False)
+        ttk.Label(
+            holder,
+            text=label_text,
+            wraplength=max(120, tile_w - 10),
+            justify="center",
+        ).pack(fill="both", expand=True, padx=1, pady=1)
+        return holder
+
+    def _pick_debug_image(self, debug_images, *names):
+        for name in names:
+            value = debug_images.get(name)
+            if value is not None:
+                return value
+        return None
+
+    def _add_review_tile(self, parent, row, title, image, img_max, is_final=False, align="center"):
+        tile = ttk.Frame(parent)
+        if align == "right":
+            tile_sticky = "ne"
+        elif align == "left":
+            tile_sticky = "nw"
+        else:
+            tile_sticky = "n"
+        tile.grid(row=row, column=0, sticky=tile_sticky, padx=0, pady=0)
+        title_font = ("Segoe UI", 10, "bold") if is_final else ("Segoe UI", 9, "normal")
+        ttk.Label(tile, text=title, font=title_font).pack(anchor="center", pady=(0, 1))
+
+        if image is None:
+            self._create_review_fallback_tile(tile, "Missing image", img_max[0], img_max[1]).pack(
+                fill="both",
+                expand=True,
+            )
+            return False
+
+        try:
+            photo, _ = get_bgr_to_tk_image(image, max_size=img_max)
+        except Exception:
+            photo = None
+
+        if photo is None:
+            self._create_review_fallback_tile(tile, "Unable to render image", img_max[0], img_max[1]).pack(
+                fill="both",
+                expand=True,
+            )
+            return False
+
+        self.preview_refs.append(photo)
+        image_holder = ttk.Frame(tile)
+        image_holder.pack(fill="both", expand=True)
+        if align == "right":
+            image_anchor = "e"
+        elif align == "left":
+            image_anchor = "w"
+        else:
+            image_anchor = "center"
+        ttk.Label(image_holder, image=photo).pack(anchor=image_anchor, expand=True)
+        return True
+
+    def _render_results_info(self, info, video_path, feature_results):
+        video_name = os.path.basename(video_path)
+        blond_frame = feature_results.get("blond_frame")
+        spatial_summary = feature_results.get("channeling_spatial_summary") or {}
+        channel_quality = feature_results.get("channeling_quality") or {}
+        overall_quality = feature_results.get("quality") or {}
+        diagnostics = feature_results.get("diagnostics") or {}
+        model_prediction = feature_results.get("model_prediction") or {}
+        combined_assessment = feature_results.get("combined_assessment") or {}
+
+        ttk.Label(info, text=f"Video: {video_name}", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(info, text=f"Blonding frame: {blond_frame}").pack(anchor="w")
+        if model_prediction.get("predicted_label"):
+            prediction_text = f"ML prediction: {model_prediction['predicted_label']}"
+            if model_prediction.get("confidence") is not None:
+                prediction_text += f" ({float(model_prediction['confidence']):.2f})"
+            ttk.Label(info, text=prediction_text, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        if spatial_summary.get("dominant_quadrant"):
+            ttk.Label(info, text=f"Dominant channeling quadrant: {spatial_summary['dominant_quadrant']}").pack(anchor="w")
+        if spatial_summary.get("global_left_right_asymmetry") is not None:
+            ttk.Label(
+                info,
+                text=f"Global left/right asymmetry: {float(spatial_summary.get('global_left_right_asymmetry', 0.0)):+.2f}",
+            ).pack(anchor="w")
+        if overall_quality.get("overall_score") is not None:
+            ttk.Label(info, text=f"Overall quality score: {float(overall_quality.get('overall_score', 0.0)):.2f}").pack(anchor="w")
+        if combined_assessment.get("explanation"):
+            ttk.Label(
+                info,
+                text=f"Combined assessment: {combined_assessment['explanation']}",
+                wraplength=620,
+                justify="left",
+            ).pack(anchor="w")
+
+        diagnostic_flags = diagnostics.get("flags") or []
+        if diagnostic_flags:
+            flag_lines = []
+            for flag in diagnostic_flags[:5]:
+                title = flag.get("title") or flag.get("code")
+                reason = flag.get("reason") or flag.get("description") or ""
+                flag_lines.append(f"- {title}: {reason}")
+            ttk.Label(
+                info,
+                text="Diagnostic flags:\n" + "\n".join(flag_lines),
+                wraplength=620,
+                justify="left",
+            ).pack(anchor="w")
+        else:
+            quality_flags = overall_quality.get("flags") or channel_quality.get("flags") or []
+            if quality_flags:
+                ttk.Label(info, text=f"Quality flags: {', '.join(quality_flags)}", wraplength=620).pack(anchor="w")
+
+        return {
+            "video_name": video_name,
+            "blond_frame": blond_frame,
+        }
+
+    def _render_results_plots(self, parent, feature_results, fps, start_frame, blond_frame):
+        channeling = feature_results.get("channeling_counts") or []
+        fig = Figure(figsize=(7.3, 10.2), dpi=100)
+        ax_top = fig.add_subplot(2, 1, 1)
+        ax_mid = fig.add_subplot(2, 1, 2)
+
+        brightness = np.array(feature_results.get("brightness_curve"), dtype=float)
+
+        if len(brightness) > 0:
+            norm_brightness = (brightness - np.nanmin(brightness)) / (np.nanmax(brightness) - np.nanmin(brightness) + 1e-6)
+            if len(norm_brightness) > 2:
+                norm_brightness = np.convolve(norm_brightness, np.ones(3) / 3, mode="same")
+
+            time_axis = np.arange(len(norm_brightness)) / fps
+            ax_top.plot(time_axis, norm_brightness, label="Blonding rate")
+            if blond_frame is not None:
+                ax_top.axvline(
+                    x=(int(blond_frame) - start_frame) / fps,
+                    color="r",
+                    linestyle="--",
+                    label="Blonding point",
+                )
+            ax_top.set_title("Espresso Stream Colour Transition")
+            ax_top.set_xlabel("Time (s)")
+            ax_top.set_ylabel("Normalised value")
+            ax_top.grid(alpha=0.3)
+            ax_top.legend(loc="best")
+        else:
+            ax_top.text(0.5, 0.5, "No brightness data", ha="center", va="center")
+
+        if len(channeling) > 0:
+            times = np.arange(len(channeling)) / fps
+            channeling_arr = np.array(channeling, dtype=float)
+            ax_mid.plot(times, channeling_arr, color="red", linewidth=2.0, label="Visible holes (total)")
+
+            quadrant_curves = feature_results.get("channel_quadrant_count_curves") or {}
+            q_tl = np.array(quadrant_curves.get("top_left") or [], dtype=float)
+            q_tr = np.array(quadrant_curves.get("top_right") or [], dtype=float)
+            q_bl = np.array(quadrant_curves.get("bottom_left") or [], dtype=float)
+            q_br = np.array(quadrant_curves.get("bottom_right") or [], dtype=float)
+
+            if (
+                len(q_tl) == len(channeling_arr)
+                and len(q_tr) == len(channeling_arr)
+                and len(q_bl) == len(channeling_arr)
+                and len(q_br) == len(channeling_arr)
+            ):
+                q_sum = q_tl + q_tr + q_bl + q_br
+
+                ax_mid.plot(times, q_tl, color="#1f77b4", linewidth=1.1, alpha=0.9, label="Top-left")
+                ax_mid.plot(times, q_tr, color="#ff7f0e", linewidth=1.1, alpha=0.9, label="Top-right")
+                ax_mid.plot(times, q_bl, color="#2ca02c", linewidth=1.1, alpha=0.9, label="Bottom-left")
+                ax_mid.plot(times, q_br, color="#9467bd", linewidth=1.1, alpha=0.9, label="Bottom-right")
+                ax_mid.plot(times, q_sum, color="black", linewidth=1.3, linestyle="--", label="Quadrant sum")
+
+                max_diff = float(np.nanmax(np.abs(channeling_arr - q_sum))) if len(q_sum) > 0 else 0.0
+                if max_diff > 0.5:
+                    ax_mid.text(
+                        0.01,
+                        0.97,
+                        f"Warning: max total-vs-sum diff = {max_diff:.0f}",
+                        transform=ax_mid.transAxes,
+                        fontsize=9,
+                        va="top",
+                        ha="left",
+                        color="#b00020",
+                        bbox=dict(boxstyle="round,pad=0.2", facecolor="#ffe8e8", alpha=0.8),
+                    )
+
+            ax_mid.set_title("Channeling keypoints per frame (count curves)")
+            ax_mid.set_xlabel("Time (s)")
+            ax_mid.set_ylabel("Keypoint count")
+            ax_mid.grid(alpha=0.3)
+            ax_mid.fill_between(times, channeling_arr, alpha=0.3, color="red")
+            ax_mid.legend(loc="best")
+        else:
+            ax_mid.text(0.5, 0.5, "No channeling data", ha="center", va="center")
+
+        fig.tight_layout(pad=2.6)
+        self.figure = fig
+        if self.canvas_widget is not None:
+            self.canvas_widget.get_tk_widget().destroy()
+        self.canvas_widget = FigureCanvasTkAgg(fig, master=parent)
+        self.canvas_widget.draw()
+        self.canvas_widget.get_tk_widget().pack(fill="both", expand=True)
+
+    def _setup_results_animation(self, right, feature_results, fps, start_frame):
+        vis_frame = ttk.LabelFrame(right, text="Frame-by-frame Detection")
+        vis_frame.pack(fill="both", expand=True, pady=(0, 6))
+
+        mask_frame = ttk.LabelFrame(right, text="Stream Detection Mask")
+        mask_frame.pack(fill="both", expand=True)
+
+        self._channeling_frames = feature_results.get("channeling_frames") or []
+        self._stream_mask_frames = feature_results.get("stream_mask_frames") or []
+        self._anim_index = 0
+        self._replay_fps = float(fps)
+        self._replay_start_frame = int(start_frame)
+        self._replay_total_frames = max(len(self._channeling_frames), len(self._stream_mask_frames))
+
+        self._anim_label = ttk.Label(vis_frame)
+        self._anim_label.pack(padx=12, pady=12)
+        self._stream_mask_label = ttk.Label(mask_frame)
+        self._stream_mask_label.pack(padx=12, pady=12)
+        self._anim_meta_label = ttk.Label(
+            vis_frame,
+            text="",
+            font=("Segoe UI", 10),
+        )
+        self._anim_meta_label.pack(anchor="center", pady=(0, 6))
+        ttk.Button(
+            vis_frame,
+            text="Export Results CSV",
+            command=self._export_results,
+        ).pack(anchor="center", pady=(0, 10))
+
+    def _reset_manual_roi_state(self):
+        self.manual_state = {
+            "drawing": False,
+            "start": (0, 0),
+            "end": (0, 0),
+            "ellipse": None,
+        }
+        self.rect_id = None
+        self.oval_id = None
+
+    def _draw_manual_roi_preview(self):
+        if self.canvas is None:
+            return
+
+        x1, y1 = self.manual_state["start"]
+        x2, y2 = self.manual_state["end"]
+
+        if self.rect_id is not None:
+            self.canvas.delete(self.rect_id)
+        if self.oval_id is not None:
+            self.canvas.delete(self.oval_id)
+
+        self.rect_id = self.canvas.create_rectangle(x1, y1, x2, y2, outline="yellow", width=2)
+        self.oval_id = self.canvas.create_oval(x1, y1, x2, y2, outline="red", width=2)
+
+    def _on_manual_roi_press(self, event):
+        self.manual_state["drawing"] = True
+        self.manual_state["start"] = (event.x, event.y)
+        self.manual_state["end"] = (event.x, event.y)
+
+    def _on_manual_roi_drag(self, event):
+        if not self.manual_state.get("drawing"):
+            return
+        self.manual_state["end"] = (event.x, event.y)
+        self._draw_manual_roi_preview()
+
+    def _on_manual_roi_release(self, event):
+        if not self.manual_state.get("drawing"):
+            return
+
+        self.manual_state["drawing"] = False
+        self.manual_state["end"] = (event.x, event.y)
+
+        x1, y1 = self.manual_state["start"]
+        x2, y2 = self.manual_state["end"]
+
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        w = abs(x2 - x1)
+        h = abs(y2 - y1)
+
+        if w < 8 or h < 8:
+            self._append_log("Selection too small. Draw a larger ellipse.")
+            return
+
+        cx_o = cx * self.manual_scale_x
+        cy_o = cy * self.manual_scale_y
+        w_o = max(1.0, w * self.manual_scale_x)
+        h_o = max(1.0, h * self.manual_scale_y)
+
+        self.manual_state["ellipse"] = ((float(cx_o), float(cy_o)), (float(w_o), float(h_o)), 0.0)
+
+    def _bind_manual_roi_canvas(self):
+        if self.canvas is None:
+            return
+        self.canvas.bind("<ButtonPress-1>", self._on_manual_roi_press)
+        self.canvas.bind("<B1-Motion>", self._on_manual_roi_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_manual_roi_release)
+
+    def _show_review_from_preview(self):
+        self._show_review_screen(
+            self.preview_info.get("video_path", ""),
+            self.preview_info.get("frame_count", len(os.listdir(frames_dir))),
+            self.preview_info.get("ellipse"),
+            self.preview_info.get("mode_size"),
+            self.preview_info.get("fast_params"),
+            self.preview_info.get("debug_images", {}),
+        )
+
     def _start(self):
         if self._anim_job is not None:
             self.root.after_cancel(self._anim_job)
@@ -300,11 +653,7 @@ class EspressoAnalysisApp:
 
             self.status_var.set("Single mode: preparing review")
             self._set_controls_enabled(False)
-            threading.Thread(
-                target=self._prepare_single_review,
-                args=(video_path,),
-                daemon=True,
-            ).start()
+            self._start_background_task(self._prepare_single_review, video_path)
         else:
             videos = list_video_files(video_dir)
             if not videos:
@@ -317,7 +666,7 @@ class EspressoAnalysisApp:
             ttk.Label(self.workspace, text="Batch processing in progress...", font=("Segoe UI", 12)).pack(
                 anchor="w", padx=10, pady=10
             )
-            threading.Thread(target=self._run_batch, args=(videos,), daemon=True).start()
+            self._start_background_task(self._run_batch, videos)
 
     def _prepare_single_review(self, video_path):
         try:
@@ -436,75 +785,39 @@ class EspressoAnalysisApp:
         right_col.rowconfigure(0, weight=1)
         right_col.rowconfigure(1, weight=1)
 
-        def fallback_tile(parent, label_text, tile_w, tile_h):
-            holder = ttk.Frame(parent, width=tile_w, height=tile_h)
-            holder.pack_propagate(False)
-            ttk.Label(
-                holder,
-                text=label_text,
-                wraplength=max(120, tile_w - 10),
-                justify="center",
-            ).pack(fill="both", expand=True, padx=1, pady=1)
-            return holder
-
-        def _pick_debug(*names):
-            for name in names:
-                value = debug_images.get(name)
-                if value is not None:
-                    return value
-            return None
-
         missing = 0
 
-        def add_tile(parent, row, title, image, img_max, is_final=False, align="center"):
-            nonlocal missing
-            tile = ttk.Frame(parent)
-            if align == "right":
-                tile_sticky = "ne"
-            elif align == "left":
-                tile_sticky = "nw"
-            else:
-                tile_sticky = "n"
-            tile.grid(row=row, column=0, sticky=tile_sticky, padx=0, pady=0)
-            title_font = ("Segoe UI", 10, "bold") if is_final else ("Segoe UI", 9, "normal")
-            ttk.Label(tile, text=title, font=title_font).pack(anchor="center", pady=(0, 1))
-
-            if image is None:
-                missing += 1
-                fallback_tile(tile, "Missing image", img_max[0], img_max[1]).pack(fill="both", expand=True)
-                return
-
-            try:
-                photo, _ = get_bgr_to_tk_image(image, max_size=img_max)
-            except Exception:
-                photo = None
-            if photo is None:
-                missing += 1
-                fallback_tile(tile, "Unable to render image", img_max[0], img_max[1]).pack(fill="both", expand=True)
-            else:
-                self.preview_refs.append(photo)
-                image_holder = ttk.Frame(tile)
-                image_holder.pack(fill="both", expand=True)
-                if align == "right":
-                    image_anchor = "e"
-                elif align == "left":
-                    image_anchor = "w"
-                else:
-                    image_anchor = "center"
-                ttk.Label(image_holder, image=photo).pack(anchor=image_anchor, expand=True)
-
-        add_tile(left_col, 0, "Original", _pick_debug("Original"), side_img_max, is_final=False, align="right")
-        add_tile(left_col, 1, "FAST Keypoints", debug_images.get("FAST Keypoints"), side_img_max, is_final=False, align="right")
-        add_tile(
+        if not self._add_review_tile(
+            left_col,
+            0,
+            "Original",
+            self._pick_debug_image(debug_images, "Original"),
+            side_img_max,
+            is_final=False,
+            align="right",
+        ):
+            missing += 1
+        if not self._add_review_tile(
+            left_col,
+            1,
+            "FAST Keypoints",
+            debug_images.get("FAST Keypoints"),
+            side_img_max,
+            is_final=False,
+            align="right",
+        ):
+            missing += 1
+        if not self._add_review_tile(
             right_col,
             0,
             "Pixel Color Change Mask",
-            _pick_debug("Change Mask (Blurred)", "Change Mask"),
+            self._pick_debug_image(debug_images, "Change Mask (Blurred)", "Change Mask"),
             side_img_max,
             is_final=False,
             align="left",
-        )
-        add_tile(
+        ):
+            missing += 1
+        if not self._add_review_tile(
             right_col,
             1,
             "Detected Features and Edges",
@@ -512,8 +825,9 @@ class EspressoAnalysisApp:
             side_img_max,
             is_final=False,
             align="left",
-        )
-        add_tile(
+        ):
+            missing += 1
+        if not self._add_review_tile(
             center_col,
             0,
             "Final Detected Portafilter",
@@ -521,7 +835,8 @@ class EspressoAnalysisApp:
             final_img_max,
             is_final=True,
             align="center",
-        )
+        ):
+            missing += 1
         if missing:
             self._append_log(f"Review payload missing {missing}/5 images.")
 
@@ -561,16 +876,13 @@ class EspressoAnalysisApp:
         self._clear_workspace()
         self._append_log(f"Running full analysis. Manual ROI used: {manual_ellipse is not None}")
 
-        threading.Thread(
-            target=self._run_full_pipeline,
-            args=(
-                info["video_path"],
-                seed_ellipse,
-                seed_mode_size,
-                seed_fast_params,
-            ),
-            daemon=True,
-        ).start()
+        self._start_background_task(
+            self._run_full_pipeline,
+            info["video_path"],
+            seed_ellipse,
+            seed_mode_size,
+            seed_fast_params,
+        )
 
     def _run_full_pipeline(self, video_path, manual_ellipse, manual_mode_size=None, manual_fast_params=None):
         try:
@@ -628,12 +940,7 @@ class EspressoAnalysisApp:
         target_w = max(320, self.root.winfo_width() - 48)
         target_h = max(260, self.root.winfo_height() - 260)
 
-        self.manual_state = {
-            "drawing": False,
-            "start": (0, 0),
-            "end": (0, 0),
-            "ellipse": None,
-        }
+        self._reset_manual_roi_state()
 
         title = ttk.Label(
             self.workspace,
@@ -658,86 +965,17 @@ class EspressoAnalysisApp:
         viewport = ttk.Frame(self.workspace)
         viewport.pack(fill="both", expand=True, padx=8, pady=(0, 6))
 
-        self._manual_scroll_canvas = tk.Canvas(viewport, highlightthickness=0)
-        self._manual_scrollbar = ttk.Scrollbar(
-            viewport, orient="vertical", command=self._manual_scroll_canvas.yview
+        self._manual_scroll_canvas, self._manual_scrollbar, inner = self._create_scrollable_container(
+            viewport,
+            bind_local_wheel=True,
         )
-        self._manual_scroll_canvas.configure(yscrollcommand=self._manual_scrollbar.set)
-        self._manual_scrollbar.pack(side="right", fill="y")
-        self._manual_scroll_canvas.pack(side="left", fill="both", expand=True)
-
-        inner = ttk.Frame(self._manual_scroll_canvas)
-        inner_id = self._manual_scroll_canvas.create_window((0, 0), window=inner, anchor="nw")
-
-        def _sync_scroll(event=None):
-            self._manual_scroll_canvas.configure(
-                scrollregion=self._manual_scroll_canvas.bbox("all")
-            )
-
-        inner.bind("<Configure>", _sync_scroll)
-        self._manual_scroll_canvas.bind(
-            "<Configure>",
-            lambda event: self._manual_scroll_canvas.itemconfigure(inner_id, width=event.width),
-        )
-        self._manual_scroll_canvas.bind("<MouseWheel>", self._on_manual_mousewheel)
-        self._manual_scroll_canvas.bind("<Button-4>", self._on_manual_mousewheel_up)
-        self._manual_scroll_canvas.bind("<Button-5>", self._on_manual_mousewheel_down)
         self._bind_manual_wheel_scroll()
 
         self.canvas = tk.Canvas(inner, width=size[0], height=size[1], bg="#111")
         self.canvas.pack(pady=(4, 8))
         self.canvas.image = photo
         self.canvas.create_image(0, 0, anchor="nw", image=photo)
-
-        self.oval_id = None
-        self.rect_id = None
-
-        def on_button_press(event):
-            self.manual_state["drawing"] = True
-            self.manual_state["start"] = (event.x, event.y)
-            self.manual_state["end"] = (event.x, event.y)
-
-        def on_button_drag(event):
-            if not self.manual_state["drawing"]:
-                return
-            self.manual_state["end"] = (event.x, event.y)
-            x1, y1 = self.manual_state["start"]
-            x2, y2 = self.manual_state["end"]
-            if self.rect_id is not None:
-                self.canvas.delete(self.rect_id)
-            if self.oval_id is not None:
-                self.canvas.delete(self.oval_id)
-            self.rect_id = self.canvas.create_rectangle(x1, y1, x2, y2, outline="yellow", width=2)
-            self.oval_id = self.canvas.create_oval(x1, y1, x2, y2, outline="red", width=2)
-
-        def on_button_release(event):
-            if not self.manual_state["drawing"]:
-                return
-            self.manual_state["drawing"] = False
-            self.manual_state["end"] = (event.x, event.y)
-
-            x1, y1 = self.manual_state["start"]
-            x2, y2 = self.manual_state["end"]
-
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
-            w = abs(x2 - x1)
-            h = abs(y2 - y1)
-
-            if w < 8 or h < 8:
-                self._append_log("Selection too small. Draw a larger ellipse.")
-                return
-
-            cx_o = cx * self.manual_scale_x
-            cy_o = cy * self.manual_scale_y
-            w_o = max(1.0, w * self.manual_scale_x)
-            h_o = max(1.0, h * self.manual_scale_y)
-
-            self.manual_state["ellipse"] = ((float(cx_o), float(cy_o)), (float(w_o), float(h_o)), 0.0)
-
-        self.canvas.bind("<ButtonPress-1>", on_button_press)
-        self.canvas.bind("<B1-Motion>", on_button_drag)
-        self.canvas.bind("<ButtonRelease-1>", on_button_release)
+        self._bind_manual_roi_canvas()
 
         controls = ttk.Frame(inner)
         controls.pack(pady=8)
@@ -746,15 +984,8 @@ class EspressoAnalysisApp:
         ttk.Button(
             controls,
             text="Back to review",
-            command=lambda: self._show_review_screen(
-                self.preview_info.get("video_path", ""),
-                len(os.listdir(frames_dir)),
-                self.preview_info.get("ellipse"),
-                self.preview_info.get("mode_size"),
-                self.preview_info.get("fast_params"),
-                self.preview_info.get("debug_images", {}),
-            ),
-            ).pack(side="left", padx=6)
+            command=self._show_review_from_preview,
+        ).pack(side="left", padx=6)
 
         self.status_var.set("Draw manual ROI, then click Continue")
 
@@ -775,24 +1006,7 @@ class EspressoAnalysisApp:
         viewport = ttk.Frame(self.workspace)
         viewport.pack(fill="both", expand=True, padx=8, pady=8)
 
-        results_canvas = tk.Canvas(viewport, highlightthickness=0)
-        results_scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=results_canvas.yview)
-        results_canvas.configure(yscrollcommand=results_scrollbar.set)
-        results_scrollbar.pack(side="right", fill="y")
-        results_canvas.pack(side="left", fill="both", expand=True)
-
-        results_inner = ttk.Frame(results_canvas)
-        inner_id = results_canvas.create_window((0, 0), window=results_inner, anchor="nw")
-
-        def _sync_results_scroll(event=None):
-            results_canvas.configure(scrollregion=results_canvas.bbox("all"))
-
-        results_inner.bind("<Configure>", _sync_results_scroll)
-        results_canvas.bind(
-            "<Configure>",
-            lambda event: results_canvas.itemconfigure(inner_id, width=event.width),
-        )
-
+        results_canvas, _results_scrollbar, results_inner = self._create_scrollable_container(viewport)
         self._manual_scroll_canvas = results_canvas
         self._bind_manual_wheel_scroll()
 
@@ -808,145 +1022,15 @@ class EspressoAnalysisApp:
         info = ttk.Frame(left)
         info.pack(fill="x")
 
-        video_name = os.path.basename(video_path)
-        blond_frame = feature_results.get("blond_frame")
         start_frame = feature_results.get("start_frame", 0)
         end_frame = feature_results.get("end_frame", 0)
         fps = feature_results.get("fps", 1.0) or 1.0
         shot_seconds = 0 if end_frame < start_frame else (end_frame - start_frame + 1) / fps
-        channeling = feature_results.get("channeling_counts") or []
-        spatial_summary = feature_results.get("channeling_spatial_summary") or {}
-        channel_quality = feature_results.get("channeling_quality") or {}
-        overall_quality = feature_results.get("quality") or {}
+        rendered_info = self._render_results_info(info, video_path, feature_results)
+        blond_frame = rendered_info["blond_frame"]
 
-        ttk.Label(info, text=f"Video: {video_name}", font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        ttk.Label(info, text=f"Blonding frame: {blond_frame}").pack(anchor="w")
-        if spatial_summary.get("dominant_quadrant"):
-            ttk.Label(info, text=f"Dominant channeling quadrant: {spatial_summary['dominant_quadrant']}").pack(anchor="w")
-        if spatial_summary.get("global_left_right_asymmetry") is not None:
-            ttk.Label(
-                info,
-                text=f"Global left/right asymmetry: {float(spatial_summary.get('global_left_right_asymmetry', 0.0)):+.2f}",
-            ).pack(anchor="w")
-        if overall_quality.get("overall_score") is not None:
-            ttk.Label(info, text=f"Overall quality score: {float(overall_quality.get('overall_score', 0.0)):.2f}").pack(anchor="w")
-        quality_flags = overall_quality.get("flags") or channel_quality.get("flags") or []
-        if quality_flags:
-            ttk.Label(info, text=f"Quality flags: {', '.join(quality_flags)}", wraplength=620).pack(anchor="w")
-
-        fig = Figure(figsize=(7.3, 10.2), dpi=100)
-        ax_top = fig.add_subplot(2, 1, 1)
-        ax_mid = fig.add_subplot(2, 1, 2)
-
-        brightness = np.array(feature_results.get("brightness_curve"), dtype=float)
-        saturation = np.array(feature_results.get("saturation_curve"), dtype=float)
-
-        if len(brightness) > 0:
-            norm_brightness = (brightness - np.nanmin(brightness)) / (np.nanmax(brightness) - np.nanmin(brightness) + 1e-6)
-            if len(norm_brightness) > 2:
-                norm_brightness = np.convolve(norm_brightness, np.ones(3) / 3, mode="same")
-
-            time_axis = np.arange(len(norm_brightness)) / fps
-            ax_top.plot(time_axis, norm_brightness, label="Blonding rate")
-            if blond_frame is not None:
-                ax_top.axvline(
-                    x=(int(blond_frame) - start_frame) / fps,
-                    color="r",
-                    linestyle="--",
-                    label="Blonding point",
-                )
-            ax_top.set_title("Espresso Stream Colour Transition")
-            ax_top.set_xlabel("Time (s)")
-            ax_top.set_ylabel("Normalised value")
-            ax_top.grid(alpha=0.3)
-            ax_top.legend(loc="best")
-        else:
-            ax_top.text(0.5, 0.5, "No brightness data", ha="center", va="center")
-
-        if len(channeling) > 0:
-            times = np.arange(len(channeling)) / fps
-            channeling_arr = np.array(channeling, dtype=float)
-            ax_mid.plot(times, channeling_arr, color="red", linewidth=2.0, label="Visible holes (total)")
-
-            quadrant_curves = feature_results.get("channel_quadrant_count_curves") or {}
-            q_tl = np.array(quadrant_curves.get("top_left") or [], dtype=float)
-            q_tr = np.array(quadrant_curves.get("top_right") or [], dtype=float)
-            q_bl = np.array(quadrant_curves.get("bottom_left") or [], dtype=float)
-            q_br = np.array(quadrant_curves.get("bottom_right") or [], dtype=float)
-
-            if (
-                len(q_tl) == len(channeling_arr)
-                and len(q_tr) == len(channeling_arr)
-                and len(q_bl) == len(channeling_arr)
-                and len(q_br) == len(channeling_arr)
-            ):
-                q_sum = q_tl + q_tr + q_bl + q_br
-
-                ax_mid.plot(times, q_tl, color="#1f77b4", linewidth=1.1, alpha=0.9, label="Top-left")
-                ax_mid.plot(times, q_tr, color="#ff7f0e", linewidth=1.1, alpha=0.9, label="Top-right")
-                ax_mid.plot(times, q_bl, color="#2ca02c", linewidth=1.1, alpha=0.9, label="Bottom-left")
-                ax_mid.plot(times, q_br, color="#9467bd", linewidth=1.1, alpha=0.9, label="Bottom-right")
-                ax_mid.plot(times, q_sum, color="black", linewidth=1.3, linestyle="--", label="Quadrant sum")
-
-                max_diff = float(np.nanmax(np.abs(channeling_arr - q_sum))) if len(q_sum) > 0 else 0.0
-                if max_diff > 0.5:
-                    ax_mid.text(
-                        0.01,
-                        0.97,
-                        f"Warning: max total-vs-sum diff = {max_diff:.0f}",
-                        transform=ax_mid.transAxes,
-                        fontsize=9,
-                        va="top",
-                        ha="left",
-                        color="#b00020",
-                        bbox=dict(boxstyle="round,pad=0.2", facecolor="#ffe8e8", alpha=0.8),
-                    )
-
-            ax_mid.set_title("Channeling keypoints per frame (count curves)")
-            ax_mid.set_xlabel("Time (s)")
-            ax_mid.set_ylabel("Keypoint count")
-            ax_mid.grid(alpha=0.3)
-            ax_mid.fill_between(times, channeling_arr, alpha=0.3, color="red")
-            ax_mid.legend(loc="best")
-        else:
-            ax_mid.text(0.5, 0.5, "No channeling data", ha="center", va="center")
-
-        fig.tight_layout(pad=2.6)
-        self.figure = fig
-        if self.canvas_widget is not None:
-            self.canvas_widget.get_tk_widget().destroy()
-        self.canvas_widget = FigureCanvasTkAgg(fig, master=left)
-        self.canvas_widget.draw()
-        self.canvas_widget.get_tk_widget().pack(fill="both", expand=True)
-
-        vis_frame = ttk.LabelFrame(right, text="Frame-by-frame Detection")
-        vis_frame.pack(fill="both", expand=True, pady=(0, 6))
-
-        mask_frame = ttk.LabelFrame(right, text="Stream Detection Mask")
-        mask_frame.pack(fill="both", expand=True)
-
-        self._channeling_frames = feature_results.get("channeling_frames") or []
-        self._stream_mask_frames = feature_results.get("stream_mask_frames") or []
-        self._anim_index = 0
-        self._replay_fps = float(fps)
-        self._replay_start_frame = int(start_frame)
-        self._replay_total_frames = max(len(self._channeling_frames), len(self._stream_mask_frames))
-
-        self._anim_label = ttk.Label(vis_frame)
-        self._anim_label.pack(padx=12, pady=12)
-        self._stream_mask_label = ttk.Label(mask_frame)
-        self._stream_mask_label.pack(padx=12, pady=12)
-        self._anim_meta_label = ttk.Label(
-            vis_frame,
-            text="",
-            font=("Segoe UI", 10),
-        )
-        self._anim_meta_label.pack(anchor="center", pady=(0, 6))
-        ttk.Button(
-            vis_frame,
-            text="Export Results CSV",
-            command=self._export_results,
-        ).pack(anchor="center", pady=(0, 10))
+        self._render_results_plots(left, feature_results, fps, start_frame, blond_frame)
+        self._setup_results_animation(right, feature_results, fps, start_frame)
 
         shot_label = ttk.Label(
             results_inner,

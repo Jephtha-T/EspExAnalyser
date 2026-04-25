@@ -9,9 +9,8 @@ from collections import Counter
 
 import joblib
 import numpy as np
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold, cross_validate
 from sklearn.pipeline import Pipeline
@@ -26,6 +25,8 @@ analysis_dir = os.path.join(base_dir, "Analysis")
 default_summary_csv = os.path.join(analysis_dir, "training_data.csv")
 default_events_csv = os.path.join(analysis_dir, "training_data_events.csv")
 default_model_path = os.path.join(analysis_dir, "extraction_model.joblib")
+default_rf_model_path = os.path.join(analysis_dir, "extraction_model_rf.joblib")
+default_svm_model_path = os.path.join(analysis_dir, "extraction_model_svm.joblib")
 
 legacy_feature_columns = [
     "shot_time",
@@ -44,10 +45,15 @@ class_name_map = {
 }
 
 feature_set_default = "auto"
-model_type_default = "auto"
+model_type_default = "both"
 
 supported_feature_sets = ("auto", "summary", "events", "combined")
-supported_model_types = ("auto", "logistic_regression", "svm", "random_forest", "extra_trees")
+supported_model_types = ("both", "svm", "random_forest")
+evaluation_scoring = {
+    "accuracy": "accuracy",
+    "balanced_accuracy": "balanced_accuracy",
+    "macro_f1": "f1_macro",
+}
 
 
 def _safe_float(value, default=0.0):
@@ -261,7 +267,7 @@ def _load_training_datasets(summary_csv_path, events_csv_path):
     return datasets
 
 
-def build_model(model_type="logistic_regression", random_state=42):
+def build_model(model_type="svm", random_state=42):
     model_key = str(model_type).strip().lower()
     if model_key not in supported_model_types:
         raise ValueError(
@@ -271,22 +277,6 @@ def build_model(model_type="logistic_regression", random_state=42):
 
     if model_key == "auto":
         raise ValueError("build_model() requires a concrete model type, not 'auto'.")
-
-    if model_key == "logistic_regression":
-        return Pipeline(
-            steps=[
-                ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler()),
-                (
-                    "classifier",
-                    LogisticRegression(
-                        max_iter=5000,
-                        class_weight="balanced",
-                        random_state=random_state,
-                    ),
-                ),
-            ]
-        )
 
     if model_key == "svm":
         return Pipeline(
@@ -307,32 +297,16 @@ def build_model(model_type="logistic_regression", random_state=42):
             ]
         )
 
-    if model_key == "random_forest":
-        return Pipeline(
-            steps=[
-                ("imputer", SimpleImputer(strategy="median")),
-                (
-                    "classifier",
-                    RandomForestClassifier(
-                        n_estimators=500,
-                        min_samples_leaf=2,
-                        random_state=random_state,
-                        class_weight="balanced_subsample",
-                    ),
-                ),
-            ]
-        )
-
     return Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
             (
                 "classifier",
-                ExtraTreesClassifier(
+                RandomForestClassifier(
                     n_estimators=500,
                     min_samples_leaf=2,
                     random_state=random_state,
-                    class_weight="balanced",
+                    class_weight="balanced_subsample",
                 ),
             ),
         ]
@@ -346,8 +320,8 @@ def _candidate_model_types(model_type):
             f"Unsupported model_type '{model_type}'. "
             f"Choose one of: {supported_model_types}"
         )
-    if model_key == "auto":
-        return ["logistic_regression", "svm", "random_forest", "extra_trees"]
+    if model_key == "both":
+        return ["svm", "random_forest"]
     return [model_key]
 
 
@@ -363,6 +337,27 @@ def _candidate_feature_sets(feature_set, datasets):
     if feature_key not in datasets:
         raise ValueError(f"Feature set '{feature_key}' is unavailable with the provided CSV files.")
     return [feature_key]
+
+
+def _run_cross_validation(model, X, y, cv):
+    return cross_validate(
+        model,
+        X,
+        y,
+        cv=cv,
+        scoring=evaluation_scoring,
+        error_score="raise",
+        n_jobs=None,
+    )
+
+
+def _apply_cv_metrics(metrics, cv_results):
+    metrics["cv_accuracy_mean"] = float(np.mean(cv_results["test_accuracy"]))
+    metrics["cv_accuracy_std"] = float(np.std(cv_results["test_accuracy"]))
+    metrics["cv_balanced_accuracy_mean"] = float(np.mean(cv_results["test_balanced_accuracy"]))
+    metrics["cv_balanced_accuracy_std"] = float(np.std(cv_results["test_balanced_accuracy"]))
+    metrics["cv_macro_f1_mean"] = float(np.mean(cv_results["test_macro_f1"]))
+    metrics["cv_macro_f1_std"] = float(np.std(cv_results["test_macro_f1"]))
 
 
 def _evaluate_candidate(model, X, y, random_state=42):
@@ -389,52 +384,18 @@ def _evaluate_candidate(model, X, y, random_state=42):
             n_repeats=n_repeats,
             random_state=random_state,
         )
-        cv_results = cross_validate(
-            model,
-            X,
-            y,
-            cv=cv,
-            scoring={
-                "accuracy": "accuracy",
-                "balanced_accuracy": "balanced_accuracy",
-                "macro_f1": "f1_macro",
-            },
-            error_score="raise",
-            n_jobs=None,
-        )
+        cv_results = _run_cross_validation(model, X, y, cv)
         metrics["evaluation_mode"] = "repeated_stratified_kfold"
         metrics["cv_splits"] = 3
         metrics["cv_repeats"] = n_repeats
-        metrics["cv_accuracy_mean"] = float(np.mean(cv_results["test_accuracy"]))
-        metrics["cv_accuracy_std"] = float(np.std(cv_results["test_accuracy"]))
-        metrics["cv_balanced_accuracy_mean"] = float(np.mean(cv_results["test_balanced_accuracy"]))
-        metrics["cv_balanced_accuracy_std"] = float(np.std(cv_results["test_balanced_accuracy"]))
-        metrics["cv_macro_f1_mean"] = float(np.mean(cv_results["test_macro_f1"]))
-        metrics["cv_macro_f1_std"] = float(np.std(cv_results["test_macro_f1"]))
+        _apply_cv_metrics(metrics, cv_results)
     elif len(y) >= 6 and min_class_count >= 2:
         n_splits = min(5, min_class_count)
         cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-        cv_results = cross_validate(
-            model,
-            X,
-            y,
-            cv=cv,
-            scoring={
-                "accuracy": "accuracy",
-                "balanced_accuracy": "balanced_accuracy",
-                "macro_f1": "f1_macro",
-            },
-            error_score="raise",
-            n_jobs=None,
-        )
+        cv_results = _run_cross_validation(model, X, y, cv)
         metrics["evaluation_mode"] = "stratified_kfold"
         metrics["cv_splits"] = n_splits
-        metrics["cv_accuracy_mean"] = float(np.mean(cv_results["test_accuracy"]))
-        metrics["cv_accuracy_std"] = float(np.std(cv_results["test_accuracy"]))
-        metrics["cv_balanced_accuracy_mean"] = float(np.mean(cv_results["test_balanced_accuracy"]))
-        metrics["cv_balanced_accuracy_std"] = float(np.std(cv_results["test_balanced_accuracy"]))
-        metrics["cv_macro_f1_mean"] = float(np.mean(cv_results["test_macro_f1"]))
-        metrics["cv_macro_f1_std"] = float(np.std(cv_results["test_macro_f1"]))
+        _apply_cv_metrics(metrics, cv_results)
 
     model.fit(X, y)
     y_pred = model.predict(X)
@@ -478,22 +439,7 @@ def _format_metric(value):
     return f"{float(value):.4f}"
 
 
-def train_model(
-    summary_csv_path=default_summary_csv,
-    events_csv_path=default_events_csv,
-    model_output_path=default_model_path,
-    random_state=42,
-    model_type=model_type_default,
-    feature_set=feature_set_default,
-):
-    datasets = _load_training_datasets(summary_csv_path, events_csv_path)
-    feature_context = _load_feature_context(summary_csv_path)
-    candidate_feature_sets = _candidate_feature_sets(feature_set, datasets)
-    candidate_model_types = _candidate_model_types(model_type)
-
-    reference_dataset = datasets[candidate_feature_sets[0]]
-    class_counts = Counter(reference_dataset["y"].tolist())
-
+def _print_training_header(summary_csv_path, events_csv_path, class_counts, feature_set, model_type):
     print("\n" + "=" * 60)
     print("TRAINING EXTRACTION LEVEL MODEL")
     print("=" * 60)
@@ -503,10 +449,10 @@ def train_model(
     print(f"Feature set request: {feature_set}")
     print(f"Model type request: {model_type}")
 
-    if len(class_counts) < 2:
-        raise ValueError("Need at least 2 classes to train a classifier.")
 
+def _evaluate_training_candidates(datasets, candidate_feature_sets, candidate_model_types, random_state=42):
     evaluated_candidates = []
+
     for feature_name in candidate_feature_sets:
         dataset = datasets[feature_name]
         X = dataset["X"]
@@ -538,22 +484,21 @@ def train_model(
                 f"{_format_metric(metrics.get('training_accuracy'))}"
             )
 
-    if not evaluated_candidates:
-        raise ValueError("No candidate models could be evaluated.")
+    return evaluated_candidates
 
-    best_result = max(evaluated_candidates, key=_candidate_rank_key)
+
+def _build_model_bundle(best_result, datasets, summary_csv_path, events_csv_path, feature_context, random_state=42):
     best_dataset = datasets[best_result["feature_set"]]
     best_model = build_model(model_type=best_result["model_type"], random_state=random_state)
     best_model.fit(best_dataset["X"], best_dataset["y"])
 
-    bundle = {
+    return {
         "model": best_model,
         "model_type": best_result["model_type"],
         "feature_set": best_result["feature_set"],
         "feature_columns": best_dataset["feature_columns"],
         "class_name_map": class_name_map,
         "metrics": best_result["metrics"],
-        "candidate_results": [_serialise_candidate_result(result) for result in evaluated_candidates],
         "feature_context": feature_context,
         "training_summary": {
             "summary_csv_path": summary_csv_path,
@@ -565,9 +510,18 @@ def train_model(
         },
     }
 
-    os.makedirs(os.path.dirname(model_output_path), exist_ok=True)
-    joblib.dump(bundle, model_output_path)
 
+def _save_model_bundle(bundle, model_output_path, candidate_results):
+    bundle_to_save = dict(bundle)
+    bundle_to_save["candidate_results"] = [
+        _serialise_candidate_result(result) for result in candidate_results
+    ]
+    os.makedirs(os.path.dirname(model_output_path), exist_ok=True)
+    joblib.dump(bundle_to_save, model_output_path)
+    return bundle_to_save
+
+
+def _print_best_model_summary(best_result, model_output_path):
     metrics = best_result["metrics"]
     print("\n" + "-" * 60)
     print("BEST MODEL")
@@ -591,7 +545,134 @@ def train_model(
     print(f"Model saved to: {model_output_path}")
     print("=" * 60)
 
+
+def train_model(
+    summary_csv_path=default_summary_csv,
+    events_csv_path=default_events_csv,
+    model_output_path=default_model_path,
+    random_state=42,
+    model_type=model_type_default,
+    feature_set=feature_set_default,
+):
+    datasets = _load_training_datasets(summary_csv_path, events_csv_path)
+    feature_context = _load_feature_context(summary_csv_path)
+    candidate_feature_sets = _candidate_feature_sets(feature_set, datasets)
+    candidate_model_types = _candidate_model_types(model_type)
+
+    reference_dataset = datasets[candidate_feature_sets[0]]
+    class_counts = Counter(reference_dataset["y"].tolist())
+
+    _print_training_header(
+        summary_csv_path=summary_csv_path,
+        events_csv_path=events_csv_path,
+        class_counts=class_counts,
+        feature_set=feature_set,
+        model_type=model_type,
+    )
+
+    if len(class_counts) < 2:
+        raise ValueError("Need at least 2 classes to train a classifier.")
+
+    evaluated_candidates = _evaluate_training_candidates(
+        datasets=datasets,
+        candidate_feature_sets=candidate_feature_sets,
+        candidate_model_types=candidate_model_types,
+        random_state=random_state,
+    )
+
+    if not evaluated_candidates:
+        raise ValueError("No candidate models could be evaluated.")
+
+    best_result = max(evaluated_candidates, key=_candidate_rank_key)
+    bundle = _build_model_bundle(
+        best_result=best_result,
+        datasets=datasets,
+        summary_csv_path=summary_csv_path,
+        events_csv_path=events_csv_path,
+        feature_context=feature_context,
+        random_state=random_state,
+    )
+    bundle = _save_model_bundle(bundle, model_output_path, evaluated_candidates)
+    _print_best_model_summary(best_result, model_output_path)
+
     return bundle
+
+
+def _multi_model_output_paths(model_output_path=None):
+    base_path = model_output_path or default_model_path
+    if os.path.normcase(base_path) == os.path.normcase(default_model_path):
+        return {
+            "random_forest": default_rf_model_path,
+            "svm": default_svm_model_path,
+        }
+
+    root, ext = os.path.splitext(base_path)
+    if not ext:
+        ext = ".joblib"
+    return {
+        "random_forest": f"{root}_rf{ext}",
+        "svm": f"{root}_svm{ext}",
+    }
+
+
+def _print_model_set_header(requested_models, feature_set):
+    print("\n" + "=" * 60)
+    print("TRAINING MODEL SET")
+    print("=" * 60)
+    print(f"Requested models: {', '.join(requested_models)}")
+    print(f"Feature set request: {feature_set}")
+
+
+def _print_model_comparison(requested_models, bundles, output_paths):
+    print("\n" + "=" * 60)
+    print("MODEL COMPARISON")
+    print("=" * 60)
+    for single_model_type in requested_models:
+        bundle = bundles[single_model_type]
+        metrics = bundle.get("metrics") or {}
+        print(
+            f"{single_model_type}: "
+            f"feature_set={bundle.get('feature_set')}, "
+            f"cv_bal_acc={_format_metric(metrics.get('cv_balanced_accuracy_mean'))}, "
+            f"cv_macro_f1={_format_metric(metrics.get('cv_macro_f1_mean'))}, "
+            f"train_acc={_format_metric(metrics.get('training_accuracy'))}, "
+            f"path={output_paths[single_model_type]}"
+        )
+    print("=" * 60)
+
+
+def train_models(
+    summary_csv_path=default_summary_csv,
+    events_csv_path=default_events_csv,
+    model_output_path=default_model_path,
+    random_state=42,
+    model_type=model_type_default,
+    feature_set=feature_set_default,
+):
+    requested_models = _candidate_model_types(model_type)
+    output_paths = _multi_model_output_paths(model_output_path)
+    bundles = {}
+
+    _print_model_set_header(requested_models, feature_set)
+
+    for single_model_type in requested_models:
+        print("\n" + "#" * 60)
+        print(f"TRAINING {single_model_type.upper()}")
+        print("#" * 60)
+        bundle = train_model(
+            summary_csv_path=summary_csv_path,
+            events_csv_path=events_csv_path,
+            model_output_path=output_paths[single_model_type],
+            random_state=random_state,
+            model_type=single_model_type,
+            feature_set=feature_set,
+        )
+        bundles[single_model_type] = bundle
+
+    if len(bundles) > 1:
+        _print_model_comparison(requested_models, bundles, output_paths)
+
+    return bundles
 
 
 def load_model_bundle(model_path=default_model_path):
@@ -608,6 +689,13 @@ def _build_feature_rows_from_results(results_dict):
         "summary": _prefix_row_features(summary_row, prefix="summary"),
         "events": _prefix_row_features(event_row, prefix="events"),
     }
+
+
+def _merge_feature_rows(*rows):
+    combined = {}
+    for row in rows:
+        combined.update(row)
+    return combined
 
 
 def feature_row_from_results_dict(results_dict, feature_set="summary"):
@@ -634,10 +722,7 @@ def feature_row_from_results_dict(results_dict, feature_set="summary"):
     if feature_key == "events":
         return feature_rows["events"]
     if feature_key == "combined":
-        combined = {}
-        combined.update(feature_rows["summary"])
-        combined.update(feature_rows["events"])
-        return combined
+        return _merge_feature_rows(feature_rows["summary"], feature_rows["events"])
 
     raise ValueError(
         f"Unsupported feature_set '{feature_set}'. "
@@ -678,8 +763,7 @@ def _apply_bundle_feature_context(feature_row, bundle):
     return hydrated
 
 
-def predict_from_feature_row(feature_row, model_path=default_model_path):
-    bundle = load_model_bundle(model_path)
+def _predict_from_bundle(feature_row, bundle):
     model = bundle["model"]
     feature_columns = bundle.get("feature_columns", list(legacy_feature_columns))
     names_map = bundle.get("class_name_map", class_name_map)
@@ -713,20 +797,28 @@ def predict_from_feature_row(feature_row, model_path=default_model_path):
     }
 
 
-def predict_from_results_json(results_json_path, model_path=default_model_path):
-    bundle = load_model_bundle(model_path)
+def _resolve_bundle_feature_set(bundle):
     bundle_feature_set = bundle.get("feature_set")
     if bundle_feature_set is None:
-        feature_set = "legacy"
-    else:
-        feature_set = bundle_feature_set
+        return "legacy"
+    return bundle_feature_set
+
+
+def predict_from_feature_row(feature_row, model_path=default_model_path):
+    bundle = load_model_bundle(model_path)
+    return _predict_from_bundle(feature_row, bundle)
+
+
+def predict_from_results_json(results_json_path, model_path=default_model_path):
+    bundle = load_model_bundle(model_path)
+    feature_set = _resolve_bundle_feature_set(bundle)
 
     feature_row, raw_results = feature_row_from_results_json(
         results_json_path,
         feature_set=feature_set,
     )
     feature_row = _apply_bundle_feature_context(feature_row, bundle)
-    prediction = predict_from_feature_row(feature_row, model_path=model_path)
+    prediction = _predict_from_bundle(feature_row, bundle)
     prediction["video_name"] = raw_results.get("video_name")
     prediction["results_json"] = results_json_path
     prediction["feature_set"] = feature_set
@@ -734,11 +826,26 @@ def predict_from_results_json(results_json_path, model_path=default_model_path):
     return prediction
 
 
+def predict_from_results_dict(results_dict, model_path=default_model_path):
+    bundle = load_model_bundle(model_path)
+    feature_set = _resolve_bundle_feature_set(bundle)
+    feature_row = feature_row_from_results_dict(results_dict, feature_set=feature_set)
+    feature_row = _apply_bundle_feature_context(feature_row, bundle)
+    prediction = _predict_from_bundle(feature_row, bundle)
+    prediction["video_name"] = results_dict.get("video_name")
+    prediction["feature_set"] = feature_set
+    prediction["model_type"] = bundle.get("model_type")
+    return prediction
+
+
 def _build_arg_parser():
     parser = argparse.ArgumentParser(description="Train and use espresso extraction classifier.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command", required=False)
 
-    train_parser = subparsers.add_parser("train", help="Train model from exported training CSV files")
+    train_parser = subparsers.add_parser(
+        "train",
+        help="Train model from exported training CSV files (default action when no command is given)",
+    )
     train_parser.add_argument(
         "--csv",
         default=default_summary_csv,
@@ -754,7 +861,7 @@ def _build_arg_parser():
         "--model-type",
         default=model_type_default,
         choices=list(supported_model_types),
-        help="Model family to train, or 'auto' to compare multiple candidates.",
+        help="Model family to train. Use 'both' to train and save Random Forest and SVM together.",
     )
     train_parser.add_argument(
         "--feature-set",
@@ -775,8 +882,18 @@ def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
 
+    if args.command is None:
+        train_models(
+            summary_csv_path=default_summary_csv,
+            events_csv_path=default_events_csv,
+            model_output_path=default_model_path,
+            model_type=model_type_default,
+            feature_set=feature_set_default,
+        )
+        return
+
     if args.command == "train":
-        train_model(
+        train_models(
             summary_csv_path=args.csv,
             events_csv_path=args.events_csv,
             model_output_path=args.model,
