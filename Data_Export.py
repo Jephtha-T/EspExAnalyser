@@ -6,6 +6,35 @@ import math
 import os
 
 
+def _normalise_video_key(value):
+    if value is None:
+        return None
+    text = os.path.splitext(str(value).strip().lower())[0]
+    return text or None
+
+
+def _video_keys_from_label_row(row):
+    keys = set()
+
+    row_id = (row.get("Id") or row.get("id") or "").strip()
+    if row_id:
+        try:
+            numeric_id = str(int(float(row_id)))
+        except ValueError:
+            numeric_id = row_id.strip()
+        for candidate in (numeric_id, f"test{numeric_id}", f"video_{numeric_id}"):
+            normalised = _normalise_video_key(candidate)
+            if normalised:
+                keys.add(normalised)
+
+    video_name = row.get("Video Name") or row.get("video_name") or ""
+    normalised_name = _normalise_video_key(video_name)
+    if normalised_name:
+        keys.add(normalised_name)
+
+    return keys
+
+
 def load_all_results(analysis_dir):
     # Load all *_results.json files from Analysis or Analysis/results.
     results_list = []
@@ -88,12 +117,8 @@ def load_labels(labels_csv_path):
 
                         labels_in_order.append(label_id)
 
-                        row_id = (row.get("Id") or row.get("id") or "").strip()
-                        if row_id:
-                            try:
-                                labels_by_video[f"test{int(float(row_id))}"] = label_id
-                            except ValueError:
-                                continue
+                        for key in _video_keys_from_label_row(row):
+                            labels_by_video[key] = label_id
 
                 parse_error = None
                 break
@@ -384,6 +409,60 @@ def build_event_row(result, label, frame_rows):
     return event_row
 
 
+def build_summary_row(result, label, event_row=None):
+    video_id = str(result.get("video_name", "unknown"))
+    channel_stats = result.get("channeling_stats") or {}
+    flow_start = _as_int(result.get("flow_start"), 0)
+    flow_end = _as_int(result.get("flow_end"), flow_start)
+
+    if event_row is None:
+        frame_rows = build_frame_rows(result, label)
+        event_row = build_event_row(result, label, frame_rows)
+
+    shot_time = flow_end - flow_start
+    blonding_rate = _as_float(result.get("blond_rate")) or 0.0
+    channeling_avg = _as_float(channel_stats.get("average")) or 0.0
+    channeling_max = _as_float(channel_stats.get("max")) or 0.0
+    channeling_min = _as_float(channel_stats.get("min")) or 0.0
+
+    ch_range = channeling_max - channeling_min
+    ch_range_norm = ch_range / channeling_max if channeling_max > 0 else 0.0
+
+    if ch_range > 0:
+        ch_coverage_norm = (channeling_avg - channeling_min) / ch_range
+        ch_coverage_norm = max(0.0, min(1.0, ch_coverage_norm))
+    else:
+        ch_coverage_norm = 0.5
+
+    return {
+        "video_id": video_id,
+        "label": label if label is not None else "",
+        "shot_time": shot_time,
+        "shot_time_s": event_row.get("shot_time_s"),
+        "blond_frame": result.get("blond_frame"),
+        "blonding_rate": blonding_rate,
+        "blonding_rate_norm": None,
+        "channeling_range": ch_range,
+        "channeling_range_norm": ch_range_norm,
+        "channeling_coverage_norm": ch_coverage_norm,
+        "t_blond_20_s": event_row.get("t_blond_20_s"),
+        "t_blond_40_s": event_row.get("t_blond_40_s"),
+        "t_blond_60_s": event_row.get("t_blond_60_s"),
+        "t_blond_80_s": event_row.get("t_blond_80_s"),
+        "t_channel_5_s": event_row.get("t_channel_5_s"),
+        "t_channel_10_s": event_row.get("t_channel_10_s"),
+        "channel_peak_s": event_row.get("channel_peak_s"),
+        "channel_peak_value": event_row.get("channel_peak_value"),
+        "channel_recovery_s": event_row.get("channel_recovery_s"),
+        "flow_quality_score": _as_float(event_row.get("flow_quality_score")) or 0.0,
+        "channel_quality_score": _as_float(event_row.get("channel_quality_score")) or 0.0,
+        "overall_quality_score": _as_float(event_row.get("overall_quality_score")) or 0.0,
+        "channel_global_lr_asymmetry": _as_float(event_row.get("channel_global_lr_asymmetry")) or 0.0,
+        "channel_global_tb_asymmetry": _as_float(event_row.get("channel_global_tb_asymmetry")) or 0.0,
+        "channel_mean_spatial_entropy": _as_float(event_row.get("channel_mean_spatial_entropy")) or 0.0,
+    }
+
+
 def export_to_csv(analysis_dir, output_file="training_data.csv"):
     # Build frame-level and shot-level datasets from extracted result JSON files.
     print("\n" + "=" * 60)
@@ -399,92 +478,37 @@ def export_to_csv(analysis_dir, output_file="training_data.csv"):
 
     base_dir = os.path.dirname(analysis_dir)
     labels_csv_path = os.path.join(base_dir, "dataset.csv")
-    labels_by_video, labels_in_order = load_labels(labels_csv_path)
+    labels_by_video, _ = load_labels(labels_csv_path)
 
     frame_rows_all = []
     event_rows = []
-    raw_summary = []
+    summary_rows = []
+    unmatched_video_ids = []
 
-    for index, result in enumerate(results_list):
+    for result in results_list:
         video_id = str(result.get("video_name", "unknown"))
-        label = labels_by_video.get(video_id)
-        if label is None and index < len(labels_in_order):
-            label = labels_in_order[index]
+        label = labels_by_video.get(_normalise_video_key(video_id))
+        if label is None:
+            unmatched_video_ids.append(video_id)
 
         frame_rows = build_frame_rows(result, label)
         event_row = build_event_row(result, label, frame_rows)
+        summary_row = build_summary_row(result, label, event_row=event_row)
 
         frame_rows_all.extend(frame_rows)
         event_rows.append(event_row)
+        summary_rows.append(summary_row)
 
-        channel_stats = result.get("channeling_stats") or {}
-        flow_start = _as_int(result.get("flow_start"), 0)
-        flow_end = _as_int(result.get("flow_end"), flow_start)
-
-        raw_summary.append(
-            {
-                "video_id": video_id,
-                "label": label if label is not None else "",
-                "shot_time": flow_end - flow_start,
-                "shot_time_s": event_row["shot_time_s"],
-                "blonding_rate": _as_float(result.get("blond_rate")) or 0.0,
-                "blond_frame": result.get("blond_frame"),
-                "channeling_avg": _as_float(channel_stats.get("average")) or 0.0,
-                "channeling_max": _as_float(channel_stats.get("max")) or 0.0,
-                "channeling_min": _as_float(channel_stats.get("min")) or 0.0,
-                "flow_quality_score": _as_float(event_row.get("flow_quality_score")) or 0.0,
-                "channel_quality_score": _as_float(event_row.get("channel_quality_score")) or 0.0,
-                "overall_quality_score": _as_float(event_row.get("overall_quality_score")) or 0.0,
-                "channel_global_lr_asymmetry": _as_float(event_row.get("channel_global_lr_asymmetry")) or 0.0,
-                "channel_global_tb_asymmetry": _as_float(event_row.get("channel_global_tb_asymmetry")) or 0.0,
-                "channel_mean_spatial_entropy": _as_float(event_row.get("channel_mean_spatial_entropy")) or 0.0,
-            }
-        )
-
-    shot_times = [row["shot_time"] for row in raw_summary]
-    blonding_rates = [row["blonding_rate"] for row in raw_summary]
-    min_shot_time, max_shot_time = min(shot_times), max(shot_times)
-    min_blonding, max_blonding = min(blonding_rates), max(blonding_rates)
-
-    summary_rows = []
-    for shot_row, event_row in zip(raw_summary, event_rows):
-        ch_range = shot_row["channeling_max"] - shot_row["channeling_min"]
-        ch_range_norm = ch_range / shot_row["channeling_max"] if shot_row["channeling_max"] > 0 else 0.0
-
-        if ch_range > 0:
-            ch_coverage_norm = (shot_row["channeling_avg"] - shot_row["channeling_min"]) / ch_range
-            ch_coverage_norm = max(0.0, min(1.0, ch_coverage_norm))
-        else:
-            ch_coverage_norm = 0.5
-
-        merged_row = {
-            "video_id": shot_row["video_id"],
-            "label": shot_row["label"],
-            "shot_time": shot_row["shot_time"],
-            "shot_time_s": shot_row["shot_time_s"],
-            "blond_frame": shot_row["blond_frame"],
-            "blonding_rate": shot_row["blonding_rate"],
-            "blonding_rate_norm": normalize_value(shot_row["blonding_rate"], min_blonding, max_blonding),
-            "channeling_range": ch_range,
-            "channeling_range_norm": ch_range_norm,
-            "channeling_coverage_norm": ch_coverage_norm,
-            "t_blond_20_s": event_row.get("t_blond_20_s"),
-            "t_blond_40_s": event_row.get("t_blond_40_s"),
-            "t_blond_60_s": event_row.get("t_blond_60_s"),
-            "t_blond_80_s": event_row.get("t_blond_80_s"),
-            "t_channel_5_s": event_row.get("t_channel_5_s"),
-            "t_channel_10_s": event_row.get("t_channel_10_s"),
-            "channel_peak_s": event_row.get("channel_peak_s"),
-            "channel_peak_value": event_row.get("channel_peak_value"),
-            "channel_recovery_s": event_row.get("channel_recovery_s"),
-            "flow_quality_score": shot_row["flow_quality_score"],
-            "channel_quality_score": shot_row["channel_quality_score"],
-            "overall_quality_score": shot_row["overall_quality_score"],
-            "channel_global_lr_asymmetry": shot_row["channel_global_lr_asymmetry"],
-            "channel_global_tb_asymmetry": shot_row["channel_global_tb_asymmetry"],
-            "channel_mean_spatial_entropy": shot_row["channel_mean_spatial_entropy"],
-        }
-        summary_rows.append(merged_row)
+    if summary_rows:
+        blonding_rates = [row["blonding_rate"] for row in summary_rows]
+        min_blonding = min(blonding_rates)
+        max_blonding = max(blonding_rates)
+        for row in summary_rows:
+            row["blonding_rate_norm"] = normalize_value(
+                row["blonding_rate"],
+                min_blonding,
+                max_blonding,
+            )
 
     timeseries_path = os.path.join(analysis_dir, "training_data_timeseries.csv")
     events_path = os.path.join(analysis_dir, "training_data_events.csv")
@@ -625,6 +649,8 @@ def export_to_csv(analysis_dir, output_file="training_data.csv"):
         print(f"Saved frame-level data: {timeseries_path} ({len(frame_rows_all)} rows)")
         print(f"Saved event-level data: {events_path} ({len(event_rows)} rows)")
         print(f"Saved summary data: {summary_path} ({len(summary_rows)} rows)")
+        if unmatched_video_ids:
+            print(f"Warning: {len(unmatched_video_ids)} results had no label match: {sorted(set(unmatched_video_ids))}")
         print("=" * 60)
 
         return {
