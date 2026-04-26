@@ -5,6 +5,12 @@ import json
 import math
 import os
 
+from Frame_Extraction import (
+    DEFAULT_EXTRACTION_FPS,
+    analysed_frame_count,
+    safe_fps,
+    shot_duration_seconds,
+)
 from Espresso_Diagnostics import compute_diagnostics, flatten_diagnostic_features
 
 
@@ -186,7 +192,7 @@ def _get_frame_count(result):
     # Curves are measured over start+1..end, so expected count is end-start.
     flow_start = _as_int(result.get("flow_start"), 0)
     flow_end = _as_int(result.get("flow_end"), flow_start)
-    expected = max(0, flow_end - flow_start)
+    expected = analysed_frame_count(flow_start, flow_end)
 
     return max(
         expected,
@@ -200,10 +206,10 @@ def _get_frame_count(result):
 
 def build_frame_rows(result, label):
     video_id = str(result.get("video_name", "unknown"))
-    fps = max(_as_float(result.get("fps")) or 1.0, 1.0)
+    fps = safe_fps(_as_float(result.get("fps")), default=DEFAULT_EXTRACTION_FPS)
     flow_start = _as_int(result.get("flow_start"), 0)
     flow_end = _as_int(result.get("flow_end"), flow_start)
-    shot_time_s = max(0.0, (flow_end - flow_start + 1) / fps)
+    shot_time_s = shot_duration_seconds(flow_start, flow_end, fps)
 
     brightness_curve = result.get("brightness_curve") or []
     saturation_curve = result.get("saturation_curve") or []
@@ -332,10 +338,10 @@ def _first_crossing(frame_rows, metric_key, threshold):
 
 def build_event_row(result, label, frame_rows):
     video_id = str(result.get("video_name", "unknown"))
-    fps = max(_as_float(result.get("fps")) or 1.0, 1.0)
+    fps = safe_fps(_as_float(result.get("fps")), default=DEFAULT_EXTRACTION_FPS)
     flow_start = _as_int(result.get("flow_start"), 0)
     flow_end = _as_int(result.get("flow_end"), flow_start)
-    shot_time_s = max(0.0, (flow_end - flow_start + 1) / fps)
+    shot_time_s = shot_duration_seconds(flow_start, flow_end, fps)
     flow_detection = result.get("flow_detection") or {}
     channeling_quality = result.get("channeling_quality") or {}
     channeling_spatial_summary = result.get("channeling_spatial_summary") or {}
@@ -419,12 +425,14 @@ def build_summary_row(result, label, event_row=None):
     diagnostics = result.get("diagnostics") or compute_diagnostics(result)
     flow_start = _as_int(result.get("flow_start"), 0)
     flow_end = _as_int(result.get("flow_end"), flow_start)
+    fps = safe_fps(_as_float(result.get("fps")), default=DEFAULT_EXTRACTION_FPS)
 
     if event_row is None:
         frame_rows = build_frame_rows(result, label)
         event_row = build_event_row(result, label, frame_rows)
 
-    shot_time = flow_end - flow_start
+    shot_time = shot_duration_seconds(flow_start, flow_end, fps)
+    shot_frames = analysed_frame_count(flow_start, flow_end)
     blonding_rate = _as_float(result.get("blond_rate")) or 0.0
     channeling_avg = _as_float(channel_stats.get("average")) or 0.0
     channeling_max = _as_float(channel_stats.get("max")) or 0.0
@@ -443,6 +451,7 @@ def build_summary_row(result, label, event_row=None):
         "video_id": video_id,
         "label": label if label is not None else "",
         "shot_time": shot_time,
+        "shot_frames": shot_frames,
         "shot_time_s": event_row.get("shot_time_s"),
         "blond_frame": result.get("blond_frame"),
         "blonding_rate": blonding_rate,
@@ -625,6 +634,7 @@ def export_to_csv(analysis_dir, output_file="training_data.csv"):
         "video_id",
         "label",
         "shot_time",
+        "shot_frames",
         "shot_time_s",
         "blond_frame",
         "blonding_rate",

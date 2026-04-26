@@ -20,6 +20,7 @@ from Espresso_Analysis import (
     prepare_video_review,
     run_full_analysis,
 )
+from Frame_Extraction import DEFAULT_EXTRACTION_FPS, safe_fps, shot_duration_seconds
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -149,10 +150,10 @@ def _build_results_payload(session: AnalysisSession, run_output: dict[str, Any])
     results_json = run_output.get("results_json") or {}
     feature_results = run_output.get("feature_results") or {}
     tracking_result = run_output.get("tracking_result") or {}
-    fps = float(results_json.get("fps") or feature_results.get("fps") or 1.0)
+    fps = safe_fps(results_json.get("fps") or feature_results.get("fps"), default=DEFAULT_EXTRACTION_FPS)
     start_frame = int(results_json.get("flow_start", feature_results.get("start_frame", 0)) or 0)
     end_frame = int(results_json.get("flow_end", feature_results.get("end_frame", start_frame)) or start_frame)
-    shot_time_seconds = max(0.0, float(end_frame - start_frame + 1) / max(1.0, fps))
+    shot_time_seconds = shot_duration_seconds(start_frame, end_frame, fps)
 
     quality = results_json.get("quality") or {}
     model_prediction = results_json.get("model_prediction") or {}

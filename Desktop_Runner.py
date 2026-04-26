@@ -18,6 +18,7 @@ from Espresso_Analysis import (
     run_batch_video,
     run_full_analysis,
 )
+from Frame_Extraction import DEFAULT_EXTRACTION_FPS, safe_fps, shot_duration_seconds
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 workspace = build_workspace(base_dir)
@@ -101,7 +102,7 @@ class EspressoAnalysisApp:
         self._anim_label = None
         self._stream_mask_label = None
         self._anim_meta_label = None
-        self._replay_fps = 1.0
+        self._replay_fps = DEFAULT_EXTRACTION_FPS
         self._replay_start_frame = 0
         self._replay_total_frames = 0
         self._results_export_state = {}
@@ -582,7 +583,7 @@ class EspressoAnalysisApp:
             ax.imshow(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
     def _build_results_report_figure(self, video_path, tracking_result, feature_results):
-        fps = feature_results.get("fps", 1.0) or 1.0
+        fps = safe_fps(feature_results.get("fps"), default=DEFAULT_EXTRACTION_FPS)
         start_frame = feature_results.get("start_frame", 0)
         blond_frame = feature_results.get("blond_frame")
         report_lines = self._build_results_summary_lines(video_path, feature_results)
@@ -622,8 +623,8 @@ class EspressoAnalysisApp:
             lines.append(f"Tracked frames: {tracking_count}")
         start_frame = feature_results.get("start_frame", 0)
         end_frame = feature_results.get("end_frame", 0)
-        fps = feature_results.get("fps", 1.0) or 1.0
-        shot_seconds = 0 if end_frame < start_frame else (end_frame - start_frame + 1) / fps
+        fps = safe_fps(feature_results.get("fps"), default=DEFAULT_EXTRACTION_FPS)
+        shot_seconds = shot_duration_seconds(start_frame, end_frame, fps)
         lines.append(f"Total shot time: {shot_seconds:.2f} s")
         with open(output_path, "w", encoding="utf-8") as handle:
             handle.write("\n".join(lines) + "\n")
@@ -682,7 +683,7 @@ class EspressoAnalysisApp:
         if not selected_dir:
             return
 
-        fps = feature_results.get("fps", 1.0) or 1.0
+        fps = safe_fps(feature_results.get("fps"), default=DEFAULT_EXTRACTION_FPS)
         start_frame = feature_results.get("start_frame", 0)
         blond_frame = feature_results.get("blond_frame")
         stem = self._normalise_export_name(os.path.splitext(os.path.basename(video_path))[0])
@@ -1213,8 +1214,8 @@ class EspressoAnalysisApp:
 
         start_frame = feature_results.get("start_frame", 0)
         end_frame = feature_results.get("end_frame", 0)
-        fps = feature_results.get("fps", 1.0) or 1.0
-        shot_seconds = 0 if end_frame < start_frame else (end_frame - start_frame + 1) / fps
+        fps = safe_fps(feature_results.get("fps"), default=DEFAULT_EXTRACTION_FPS)
+        shot_seconds = shot_duration_seconds(start_frame, end_frame, fps)
         rendered_info = self._render_results_info(info, video_path, feature_results)
         blond_frame = rendered_info["blond_frame"]
 
@@ -1297,7 +1298,8 @@ class EspressoAnalysisApp:
         elif self._stream_mask_label is not None:
             self._stream_mask_label.configure(text="No stream mask frames")
 
-        self._anim_job = self.root.after(250, self._animate_channeling_frame)
+        replay_delay_ms = max(1, int(round(1000.0 / max(0.5, float(self._replay_fps)))))
+        self._anim_job = self.root.after(replay_delay_ms, self._animate_channeling_frame)
 
     def _stop_animation(self):
         if self._anim_job is not None:

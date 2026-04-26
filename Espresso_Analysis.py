@@ -5,9 +5,15 @@ from dataclasses import asdict, dataclass
 
 import cv2
 
+from Frame_Extraction import (
+    DEFAULT_EXTRACTION_FPS,
+    PREVIEW_FRAME_OFFSET_SECONDS,
+    extract_frames,
+    load_preview_frames,
+    safe_fps,
+)
 from Data_Export import export_to_csv
 from Feature_Extraction import extract_features_from_video
-from Frame_Extraction import extract_frames, load_preview_frames
 from Portafilter_Detection import (
     detect_elliptical_portafilter_with_holes,
     preload_portafilter_yolo_model,
@@ -249,27 +255,22 @@ def denormalize_ellipse(ellipse_payload, frame_width, frame_height):
 def prepare_video_review(
     video_path,
     workspace,
-    target_fps=1.0,
-    second_frame_offset=20,
+    target_fps=DEFAULT_EXTRACTION_FPS,
+    second_frame_offset_seconds=PREVIEW_FRAME_OFFSET_SECONDS,
     preview_max_width=1280,
 ):
     workspace.ensure()
     clear_workspace_images(workspace)
+    target_fps = safe_fps(target_fps)
 
     preview = load_preview_frames(
         video_path,
-        target_fps=max(1.0, float(target_fps)),
-        second_sample_index=second_frame_offset,
+        target_fps=target_fps,
+        second_offset_seconds=second_frame_offset_seconds,
     )
     first_frame = preview["first_frame"]
     second_frame = preview["second_frame"]
-    frame_count = max(
-        1,
-        int(
-            (preview["sampling"]["total_frames"] + preview["sampling"]["frame_interval"] - 1)
-            // max(1, preview["sampling"]["frame_interval"])
-        ),
-    )
+    frame_count = max(1, int(preview["sampling"].get("sample_count") or 0))
     detection = detect_portafilter_preview(
         first_frame,
         second_frame,
@@ -298,12 +299,14 @@ def run_full_analysis(
     approved_ellipse,
     approved_mode_size=None,
     approved_fast_params=None,
+    target_fps=DEFAULT_EXTRACTION_FPS,
     capture_channeling_frames=True,
     progress_callback=None,
     save_crops_to_disk=True,
 ):
     workspace.ensure()
     clear_workspace_images(workspace)
+    target_fps = safe_fps(target_fps)
 
     if progress_callback is not None:
         progress_callback(
@@ -312,7 +315,7 @@ def run_full_analysis(
             stage_label="Frame Extraction",
             message="Extracting working frames for full analysis...",
         )
-    frame_count = extract_frames(video_path, workspace.frames_dir, target_fps=1.0)
+    frame_count = extract_frames(video_path, workspace.frames_dir, target_fps=target_fps)
     if frame_count < 2:
         raise RuntimeError("Not enough frames extracted for analysis.")
 
@@ -330,6 +333,7 @@ def run_full_analysis(
         manual_ellipse=approved_ellipse,
         save_crops=save_crops_to_disk,
         return_crops=True,
+        sampled_fps=target_fps,
     )
 
     analysis_ellipse = tracking_result.get("ellipse_in_crop") or approved_ellipse
@@ -364,6 +368,7 @@ def run_full_analysis(
         portafilter_override_ellipse=analysis_ellipse,
         portafilter_override_hole_size=analysis_hole_size,
         portafilter_override_fast_params=analysis_fast_params,
+        fps=target_fps,
     )
     if feature_results is None:
         raise RuntimeError("Feature extraction produced no results.")
@@ -384,14 +389,16 @@ def run_full_analysis(
     }
 
 
-def run_batch_video(video_path, workspace):
-    review = prepare_video_review(video_path, workspace)
+def run_batch_video(video_path, workspace, target_fps=DEFAULT_EXTRACTION_FPS):
+    target_fps = safe_fps(target_fps)
+    review = prepare_video_review(video_path, workspace, target_fps=target_fps)
     return run_full_analysis(
         video_path=video_path,
         workspace=workspace,
         approved_ellipse=review["ellipse"],
         approved_mode_size=review["mode_size"],
         approved_fast_params=review["fast_params"],
+        target_fps=target_fps,
         capture_channeling_frames=False,
     )
 

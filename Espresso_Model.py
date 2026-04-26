@@ -11,13 +11,15 @@ import joblib
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, classification_report
-from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold, cross_validate
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score, make_scorer
+from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold, cross_validate, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
 from Data_Export import build_event_row, build_frame_rows, build_summary_row
+from Frame_Extraction import DEFAULT_EXTRACTION_FPS, safe_fps, shot_duration_seconds
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 analysis_dir = os.path.join(base_dir, "Analysis")
@@ -27,6 +29,7 @@ default_events_csv = os.path.join(analysis_dir, "training_data_events.csv")
 default_model_path = os.path.join(analysis_dir, "extraction_model.joblib")
 default_rf_model_path = os.path.join(analysis_dir, "extraction_model_rf.joblib")
 default_svm_model_path = os.path.join(analysis_dir, "extraction_model_svm.joblib")
+default_logistic_model_path = os.path.join(analysis_dir, "extraction_model_logistic.joblib")
 
 legacy_feature_columns = [
     "shot_time",
@@ -45,15 +48,32 @@ class_name_map = {
 }
 
 feature_set_default = "auto"
-model_type_default = "both"
+model_type_default = "all"
 
-supported_feature_sets = ("auto", "summary", "events", "combined")
-supported_model_types = ("both", "svm", "random_forest")
-evaluation_scoring = {
-    "accuracy": "accuracy",
-    "balanced_accuracy": "balanced_accuracy",
-    "macro_f1": "f1_macro",
-}
+summary_compact_feature_columns = (
+    "summary:shot_time",
+    "summary:blonding_rate_norm",
+    "summary:channeling_range_norm",
+    "summary:channeling_coverage_norm",
+    "summary:channel_quality_score",
+    "summary:diag_score_uneven_extraction_long_high_channeling",
+    "summary:diag_flag_count",
+    "summary:diag_flag_likely_over_extraction_long_slow_blonding",
+    "summary:diag_flag_uneven_extraction_long_high_channeling",
+)
+
+summary_compact_best_feature_columns = (
+    "summary:channel_quality_score",
+    "summary:diag_score_uneven_extraction_long_high_channeling",
+    "summary:diag_flag_count",
+    "summary:diag_flag_likely_over_extraction_long_slow_blonding",
+    "summary:diag_flag_uneven_extraction_long_high_channeling",
+)
+
+supported_feature_sets = ("auto", "summary", "summary_compact", "summary_compact_best", "events", "combined")
+supported_model_types = ("all", "both", "svm", "random_forest", "logistic")
+default_test_size = 0.2
+default_random_state = 42
 
 
 def _safe_float(value, default=0.0):
@@ -81,6 +101,38 @@ def _safe_int(value, default=None):
         return int(float(value))
     except (TypeError, ValueError):
         return default
+
+
+def _ideal_binary_labels(values):
+    array = np.array(values, dtype=np.int64)
+    return (array == 1).astype(np.int64)
+
+
+def _ideal_vs_nonideal_accuracy(y_true, y_pred):
+    return accuracy_score(_ideal_binary_labels(y_true), _ideal_binary_labels(y_pred))
+
+
+def _ideal_vs_nonideal_balanced_accuracy(y_true, y_pred):
+    return balanced_accuracy_score(_ideal_binary_labels(y_true), _ideal_binary_labels(y_pred))
+
+
+def _ideal_vs_nonideal_macro_f1(y_true, y_pred):
+    return f1_score(
+        _ideal_binary_labels(y_true),
+        _ideal_binary_labels(y_pred),
+        average="macro",
+        zero_division=0,
+    )
+
+
+evaluation_scoring = {
+    "accuracy": "accuracy",
+    "balanced_accuracy": "balanced_accuracy",
+    "macro_f1": "f1_macro",
+    "ideal_vs_nonideal_accuracy": make_scorer(_ideal_vs_nonideal_accuracy),
+    "ideal_vs_nonideal_balanced_accuracy": make_scorer(_ideal_vs_nonideal_balanced_accuracy),
+    "ideal_vs_nonideal_macro_f1": make_scorer(_ideal_vs_nonideal_macro_f1),
+}
 
 
 def _compute_channeling_metrics(channeling_stats):
@@ -130,19 +182,29 @@ def _drop_sparse_columns(X, feature_columns, min_non_nan=2):
     return filtered_X, filtered_columns
 
 
-def _load_feature_context(summary_csv_path):
-    if not os.path.exists(summary_csv_path):
+def _build_feature_context_from_dataset(summary_dataset, selected_video_ids):
+    if not summary_dataset:
         return {}
 
-    blonding_values = []
-    with open(summary_csv_path, "r", encoding="utf-8-sig", newline="") as file_ref:
-        reader = csv.DictReader(file_ref)
-        for row in reader:
-            label = _safe_int(row.get("label"), default=None)
-            if label not in (0, 1, 2):
-                continue
-            blonding_values.append(_safe_float(row.get("blonding_rate"), default=0.0))
+    feature_columns = list(summary_dataset.get("feature_columns") or [])
+    if "summary:blonding_rate" not in feature_columns:
+        return {}
 
+    selected_ids = [str(video_id) for video_id in (selected_video_ids or [])]
+    if not selected_ids:
+        return {}
+
+    video_ids = [str(video_id) for video_id in (summary_dataset.get("video_ids") or [])]
+    id_to_index = {video_id: index for index, video_id in enumerate(video_ids)}
+    raw_index = feature_columns.index("summary:blonding_rate")
+    blonding_values = []
+    for video_id in selected_ids:
+        row_index = id_to_index.get(video_id)
+        if row_index is None:
+            continue
+        raw_value = _safe_float_or_nan(summary_dataset["X"][row_index, raw_index])
+        if not np.isnan(raw_value):
+            blonding_values.append(float(raw_value))
     if not blonding_values:
         return {}
 
@@ -245,6 +307,22 @@ def _assemble_feature_dataset(summary_rows, summary_columns, events_rows, events
     }
 
 
+def _filter_dataset_feature_columns(dataset, selected_columns, feature_set_name=None):
+    selected = [column_name for column_name in selected_columns if column_name in dataset["feature_columns"]]
+    if not selected:
+        raise ValueError("No requested feature columns were found in the dataset.")
+
+    index_map = {column_name: index for index, column_name in enumerate(dataset["feature_columns"])}
+    selected_indices = [index_map[column_name] for column_name in selected]
+    return {
+        "feature_set": feature_set_name or dataset["feature_set"],
+        "video_ids": list(dataset["video_ids"]),
+        "feature_columns": list(selected),
+        "X": dataset["X"][:, selected_indices],
+        "y": dataset["y"].copy(),
+    }
+
+
 def _load_training_datasets(summary_csv_path, events_csv_path):
     summary_rows, summary_columns = _read_labeled_feature_table(summary_csv_path, prefix="summary")
     events_rows, events_columns = _read_labeled_feature_table(events_csv_path, prefix="events")
@@ -264,7 +342,119 @@ def _load_training_datasets(summary_csv_path, events_csv_path):
 
     if not datasets:
         raise ValueError("No usable labeled training rows were found in the exported CSV files.")
+
+    if "summary" in datasets:
+        try:
+            datasets["summary_compact"] = _filter_dataset_feature_columns(
+                datasets["summary"],
+                summary_compact_feature_columns,
+                feature_set_name="summary_compact",
+            )
+        except ValueError:
+            pass
+        try:
+            datasets["summary_compact_best"] = _filter_dataset_feature_columns(
+                datasets["summary"],
+                summary_compact_best_feature_columns,
+                feature_set_name="summary_compact_best",
+            )
+        except ValueError:
+            pass
     return datasets
+
+
+def _subset_dataset_by_video_ids(dataset, selected_video_ids):
+    selected_ids = [str(video_id) for video_id in (selected_video_ids or [])]
+    index_by_id = {str(video_id): index for index, video_id in enumerate(dataset["video_ids"])}
+    subset_indices = [index_by_id[video_id] for video_id in selected_ids if video_id in index_by_id]
+    return {
+        "feature_set": dataset["feature_set"],
+        "video_ids": [dataset["video_ids"][index] for index in subset_indices],
+        "feature_columns": list(dataset["feature_columns"]),
+        "X": dataset["X"][subset_indices],
+        "y": dataset["y"][subset_indices],
+    }
+
+
+def _align_candidate_datasets(datasets, candidate_feature_sets):
+    reference_dataset = datasets[candidate_feature_sets[0]]
+    common_ids = set(str(video_id) for video_id in reference_dataset["video_ids"])
+    for feature_name in candidate_feature_sets[1:]:
+        common_ids &= set(str(video_id) for video_id in datasets[feature_name]["video_ids"])
+
+    ordered_ids = [
+        str(video_id)
+        for video_id in reference_dataset["video_ids"]
+        if str(video_id) in common_ids
+    ]
+    if len(ordered_ids) < 2:
+        raise ValueError("Need at least 2 shared labeled videos across the selected feature sets.")
+
+    return {
+        feature_name: _subset_dataset_by_video_ids(datasets[feature_name], ordered_ids)
+        for feature_name in candidate_feature_sets
+    }
+
+
+def _normalise_test_size(test_size, sample_count, class_count):
+    if 0 < float(test_size) < 1:
+        test_count = int(math.ceil(float(sample_count) * float(test_size)))
+    else:
+        test_count = int(round(float(test_size)))
+
+    test_count = max(int(class_count), test_count)
+    test_count = min(int(sample_count - class_count), test_count)
+    if test_count < int(class_count):
+        raise ValueError(
+            "Unable to create a stratified holdout split. "
+            "Need enough samples to place at least one item from each class in both train and test."
+        )
+    return int(test_count)
+
+
+def _build_holdout_split(dataset, test_size=default_test_size, random_state=default_random_state):
+    video_ids = [str(video_id) for video_id in dataset["video_ids"]]
+    y = np.array(dataset["y"], dtype=np.int64)
+    class_counts = Counter(y.tolist())
+    if len(class_counts) < 2:
+        raise ValueError("Need at least 2 classes to train a classifier.")
+
+    min_class_count = min(class_counts.values())
+    if min_class_count < 2:
+        raise ValueError(
+            "A proper stratified holdout split needs at least 2 samples in every class. "
+            f"Observed class counts: {dict(class_counts)}"
+        )
+
+    test_count = _normalise_test_size(test_size, sample_count=len(video_ids), class_count=len(class_counts))
+    train_ids, test_ids = train_test_split(
+        video_ids,
+        test_size=test_count,
+        stratify=y,
+        random_state=random_state,
+    )
+
+    train_counter = Counter(
+        dataset["y"][dataset["video_ids"].index(video_id)]
+        for video_id in train_ids
+    )
+    test_counter = Counter(
+        dataset["y"][dataset["video_ids"].index(video_id)]
+        for video_id in test_ids
+    )
+
+    return {
+        "train_video_ids": [str(video_id) for video_id in train_ids],
+        "test_video_ids": [str(video_id) for video_id in test_ids],
+        "train_size": len(train_ids),
+        "test_size": len(test_ids),
+        "class_counts_full": {int(key): int(value) for key, value in class_counts.items()},
+        "class_counts_train": {int(key): int(value) for key, value in train_counter.items()},
+        "class_counts_test": {int(key): int(value) for key, value in test_counter.items()},
+        "test_fraction": float(len(test_ids) / max(1, len(video_ids))),
+        "random_state": int(random_state),
+        "stratified": True,
+    }
 
 
 def build_model(model_type="svm", random_state=42):
@@ -297,6 +487,23 @@ def build_model(model_type="svm", random_state=42):
             ]
         )
 
+    if model_key == "logistic":
+        return Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                (
+                    "classifier",
+                    LogisticRegression(
+                        C=0.5,
+                        solver="lbfgs",
+                        class_weight="balanced",
+                        max_iter=5000,
+                    ),
+                ),
+            ]
+        )
+
     return Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
@@ -320,6 +527,8 @@ def _candidate_model_types(model_type):
             f"Unsupported model_type '{model_type}'. "
             f"Choose one of: {supported_model_types}"
         )
+    if model_key == "all":
+        return ["logistic", "svm", "random_forest"]
     if model_key == "both":
         return ["svm", "random_forest"]
     return [model_key]
@@ -333,7 +542,11 @@ def _candidate_feature_sets(feature_set, datasets):
             f"Choose one of: {supported_feature_sets}"
         )
     if feature_key == "auto":
-        return [name for name in ("summary", "events", "combined") if name in datasets]
+        return [
+            name
+            for name in ("summary_compact_best", "summary_compact", "summary", "events", "combined")
+            if name in datasets
+        ]
     if feature_key not in datasets:
         raise ValueError(f"Feature set '{feature_key}' is unavailable with the provided CSV files.")
     return [feature_key]
@@ -358,6 +571,16 @@ def _apply_cv_metrics(metrics, cv_results):
     metrics["cv_balanced_accuracy_std"] = float(np.std(cv_results["test_balanced_accuracy"]))
     metrics["cv_macro_f1_mean"] = float(np.mean(cv_results["test_macro_f1"]))
     metrics["cv_macro_f1_std"] = float(np.std(cv_results["test_macro_f1"]))
+    metrics["cv_ideal_vs_nonideal_accuracy_mean"] = float(np.mean(cv_results["test_ideal_vs_nonideal_accuracy"]))
+    metrics["cv_ideal_vs_nonideal_accuracy_std"] = float(np.std(cv_results["test_ideal_vs_nonideal_accuracy"]))
+    metrics["cv_ideal_vs_nonideal_balanced_accuracy_mean"] = float(
+        np.mean(cv_results["test_ideal_vs_nonideal_balanced_accuracy"])
+    )
+    metrics["cv_ideal_vs_nonideal_balanced_accuracy_std"] = float(
+        np.std(cv_results["test_ideal_vs_nonideal_balanced_accuracy"])
+    )
+    metrics["cv_ideal_vs_nonideal_macro_f1_mean"] = float(np.mean(cv_results["test_ideal_vs_nonideal_macro_f1"]))
+    metrics["cv_ideal_vs_nonideal_macro_f1_std"] = float(np.std(cv_results["test_ideal_vs_nonideal_macro_f1"]))
 
 
 def _evaluate_candidate(model, X, y, random_state=42):
@@ -373,6 +596,13 @@ def _evaluate_candidate(model, X, y, random_state=42):
         "cv_balanced_accuracy_std": None,
         "cv_macro_f1_mean": None,
         "cv_macro_f1_std": None,
+        "cv_ideal_vs_nonideal_accuracy_mean": None,
+        "cv_ideal_vs_nonideal_accuracy_std": None,
+        "cv_ideal_vs_nonideal_balanced_accuracy_mean": None,
+        "cv_ideal_vs_nonideal_balanced_accuracy_std": None,
+        "cv_ideal_vs_nonideal_macro_f1_mean": None,
+        "cv_ideal_vs_nonideal_macro_f1_std": None,
+        "training_ideal_vs_nonideal_accuracy": None,
         "classification_report": None,
     }
 
@@ -407,7 +637,78 @@ def _evaluate_candidate(model, X, y, random_state=42):
         target_names=["under", "ideal", "over"],
         zero_division=0,
     )
+    metrics["training_ideal_vs_nonideal_accuracy"] = float(_ideal_vs_nonideal_accuracy(y, y_pred))
     return metrics
+
+
+def _prediction_confidences(model, X):
+    if hasattr(model, "predict_proba"):
+        try:
+            probabilities = model.predict_proba(X)
+            return [float(np.max(row)) for row in probabilities]
+        except Exception:
+            return None
+    return None
+
+
+def _evaluate_holdout(model, X_train, y_train, X_test, y_test, test_video_ids=None):
+    model.fit(X_train, y_train)
+    y_train_pred = model.predict(X_train)
+    y_test_pred = model.predict(X_test)
+    confidences = _prediction_confidences(model, X_test)
+    y_train_binary = _ideal_binary_labels(y_train)
+    y_test_binary = _ideal_binary_labels(y_test)
+    y_train_pred_binary = _ideal_binary_labels(y_train_pred)
+    y_test_pred_binary = _ideal_binary_labels(y_test_pred)
+    ordered_test_ids = [str(video_id) for video_id in (test_video_ids or [])]
+    test_predictions = []
+    for index, predicted_class in enumerate(y_test_pred.tolist()):
+        true_class = int(y_test[index])
+        row = {
+            "video_id": ordered_test_ids[index] if index < len(ordered_test_ids) else str(index),
+            "true_class": true_class,
+            "true_label": class_name_map.get(true_class, str(true_class)),
+            "predicted_class": int(predicted_class),
+            "predicted_label": class_name_map.get(int(predicted_class), str(predicted_class)),
+            "true_is_ideal": bool(true_class == 1),
+            "predicted_is_ideal": bool(int(predicted_class) == 1),
+        }
+        if confidences is not None and index < len(confidences):
+            row["confidence"] = float(confidences[index])
+        test_predictions.append(row)
+
+    return {
+        "train_accuracy": float(accuracy_score(y_train, y_train_pred)),
+        "test_accuracy": float(accuracy_score(y_test, y_test_pred)),
+        "test_balanced_accuracy": float(balanced_accuracy_score(y_test, y_test_pred)),
+        "test_macro_f1": float(f1_score(y_test, y_test_pred, average="macro", zero_division=0)),
+        "train_ideal_vs_nonideal_accuracy": float(accuracy_score(y_train_binary, y_train_pred_binary)),
+        "test_ideal_vs_nonideal_accuracy": float(accuracy_score(y_test_binary, y_test_pred_binary)),
+        "test_ideal_vs_nonideal_balanced_accuracy": float(
+            balanced_accuracy_score(y_test_binary, y_test_pred_binary)
+        ),
+        "test_ideal_vs_nonideal_macro_f1": float(
+            f1_score(y_test_binary, y_test_pred_binary, average="macro", zero_division=0)
+        ),
+        "test_classification_report": classification_report(
+            y_test,
+            y_test_pred,
+            labels=[0, 1, 2],
+            target_names=["under", "ideal", "over"],
+            zero_division=0,
+        ),
+        "test_ideal_vs_nonideal_confusion_matrix": confusion_matrix(
+            y_test_binary,
+            y_test_pred_binary,
+            labels=[0, 1],
+        ).tolist(),
+        "test_confusion_matrix": confusion_matrix(
+            y_test,
+            y_test_pred,
+            labels=[0, 1, 2],
+        ).tolist(),
+        "test_predictions": test_predictions,
+    }
 
 
 def _candidate_rank_key(result):
@@ -415,9 +716,11 @@ def _candidate_rank_key(result):
     score = metrics.get("cv_balanced_accuracy_mean")
     macro_f1 = metrics.get("cv_macro_f1_mean")
     accuracy = metrics.get("cv_accuracy_mean")
+    ideal_nonideal_accuracy = metrics.get("cv_ideal_vs_nonideal_accuracy_mean")
     return (
         -1.0 if score is None else float(score),
         -1.0 if macro_f1 is None else float(macro_f1),
+        -1.0 if ideal_nonideal_accuracy is None else float(ideal_nonideal_accuracy),
         -1.0 if accuracy is None else float(accuracy),
         float(metrics.get("training_accuracy") or 0.0),
     )
@@ -439,7 +742,7 @@ def _format_metric(value):
     return f"{float(value):.4f}"
 
 
-def _print_training_header(summary_csv_path, events_csv_path, class_counts, feature_set, model_type):
+def _print_training_header(summary_csv_path, events_csv_path, class_counts, feature_set, model_type, test_size, random_state):
     print("\n" + "=" * 60)
     print("TRAINING EXTRACTION LEVEL MODEL")
     print("=" * 60)
@@ -448,13 +751,15 @@ def _print_training_header(summary_csv_path, events_csv_path, class_counts, feat
     print(f"Class counts: {dict(class_counts)}")
     print(f"Feature set request: {feature_set}")
     print(f"Model type request: {model_type}")
+    print(f"Holdout test fraction request: {float(test_size):.3f}")
+    print(f"Random state: {int(random_state)}")
 
 
-def _evaluate_training_candidates(datasets, candidate_feature_sets, candidate_model_types, random_state=42):
+def _evaluate_training_candidates(datasets, candidate_feature_sets, candidate_model_types, train_video_ids, random_state=42):
     evaluated_candidates = []
 
     for feature_name in candidate_feature_sets:
-        dataset = datasets[feature_name]
+        dataset = _subset_dataset_by_video_ids(datasets[feature_name], train_video_ids)
         X = dataset["X"]
         y = dataset["y"]
 
@@ -487,27 +792,77 @@ def _evaluate_training_candidates(datasets, candidate_feature_sets, candidate_mo
     return evaluated_candidates
 
 
-def _build_model_bundle(best_result, datasets, summary_csv_path, events_csv_path, feature_context, random_state=42):
+def _fit_best_model_on_training_split(best_result, datasets, train_video_ids, test_video_ids, random_state=42):
     best_dataset = datasets[best_result["feature_set"]]
+    train_dataset = _subset_dataset_by_video_ids(best_dataset, train_video_ids)
+    test_dataset = _subset_dataset_by_video_ids(best_dataset, test_video_ids)
     best_model = build_model(model_type=best_result["model_type"], random_state=random_state)
-    best_model.fit(best_dataset["X"], best_dataset["y"])
+    holdout_metrics = _evaluate_holdout(
+        best_model,
+        train_dataset["X"],
+        train_dataset["y"],
+        test_dataset["X"],
+        test_dataset["y"],
+        test_video_ids=test_dataset["video_ids"],
+    )
+    return best_model, train_dataset, test_dataset, holdout_metrics
 
+
+def _build_model_bundle(
+    best_result,
+    best_model,
+    summary_csv_path,
+    events_csv_path,
+    feature_context,
+    split_info,
+    train_dataset,
+    test_dataset,
+    holdout_metrics,
+):
     return {
         "model": best_model,
         "model_type": best_result["model_type"],
         "feature_set": best_result["feature_set"],
-        "feature_columns": best_dataset["feature_columns"],
+        "feature_columns": train_dataset["feature_columns"],
         "class_name_map": class_name_map,
         "metrics": best_result["metrics"],
         "feature_context": feature_context,
         "training_summary": {
             "summary_csv_path": summary_csv_path,
             "events_csv_path": events_csv_path,
-            "sample_count": len(best_dataset["y"]),
-            "feature_count": len(best_dataset["feature_columns"]),
-            "class_counts": dict(Counter(best_dataset["y"].tolist())),
-            "training_video_ids": list(best_dataset["video_ids"]),
+            "sample_count": len(train_dataset["y"]),
+            "feature_count": len(train_dataset["feature_columns"]),
+            "class_counts": dict(Counter(train_dataset["y"].tolist())),
+            "training_video_ids": list(train_dataset["video_ids"]),
         },
+        "evaluation": {
+            "protocol": "heldout_test_plus_cross_validation_model_selection",
+            "selection_metric": "cv_balanced_accuracy_mean",
+            "selection_train_only_metrics": best_result["metrics"],
+            "holdout_metrics": holdout_metrics,
+            "split": split_info,
+            "test_summary": {
+                "sample_count": len(test_dataset["y"]),
+                "class_counts": dict(Counter(test_dataset["y"].tolist())),
+                "test_video_ids": list(test_dataset["video_ids"]),
+            },
+        },
+    }
+
+
+def _save_json_artifact(output_path, payload):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as file_ref:
+        json.dump(payload, file_ref, indent=2)
+
+
+def _artifact_paths_from_model_output(model_output_path):
+    root, ext = os.path.splitext(model_output_path)
+    if not ext:
+        root = model_output_path
+    return {
+        "evaluation_json": f"{root}_evaluation.json",
+        "split_json": f"{root}_split.json",
     }
 
 
@@ -516,13 +871,32 @@ def _save_model_bundle(bundle, model_output_path, candidate_results):
     bundle_to_save["candidate_results"] = [
         _serialise_candidate_result(result) for result in candidate_results
     ]
+    bundle_to_save["artifact_paths"] = _artifact_paths_from_model_output(model_output_path)
     os.makedirs(os.path.dirname(model_output_path), exist_ok=True)
     joblib.dump(bundle_to_save, model_output_path)
+
+    artifact_paths = bundle_to_save["artifact_paths"]
+    _save_json_artifact(
+        artifact_paths["evaluation_json"],
+        {
+            "model_type": bundle_to_save.get("model_type"),
+            "feature_set": bundle_to_save.get("feature_set"),
+            "metrics": bundle_to_save.get("metrics"),
+            "evaluation": bundle_to_save.get("evaluation"),
+            "candidate_results": bundle_to_save.get("candidate_results"),
+        },
+    )
+    _save_json_artifact(
+        artifact_paths["split_json"],
+        bundle_to_save.get("evaluation", {}).get("split", {}),
+    )
     return bundle_to_save
 
 
-def _print_best_model_summary(best_result, model_output_path):
+def _print_best_model_summary(best_result, bundle, model_output_path):
     metrics = best_result["metrics"]
+    evaluation = bundle.get("evaluation") or {}
+    holdout_metrics = evaluation.get("holdout_metrics") or {}
     print("\n" + "-" * 60)
     print("BEST MODEL")
     print("-" * 60)
@@ -541,8 +915,32 @@ def _print_best_model_summary(best_result, model_output_path):
             f"{metrics['cv_macro_f1_mean']:.4f} "
             f"+/- {metrics['cv_macro_f1_std']:.4f}"
         )
-    print(f"Training accuracy: {metrics['training_accuracy']:.4f}")
+    if metrics.get("cv_ideal_vs_nonideal_accuracy_mean") is not None:
+        print(
+            "CV ideal-vs-nonideal accuracy: "
+            f"{metrics['cv_ideal_vs_nonideal_accuracy_mean']:.4f} "
+            f"+/- {metrics['cv_ideal_vs_nonideal_accuracy_std']:.4f}"
+        )
+    print(f"Training accuracy (selection fit): {metrics['training_accuracy']:.4f}")
+    if metrics.get("training_ideal_vs_nonideal_accuracy") is not None:
+        print(
+            "Training ideal-vs-nonideal accuracy (selection fit): "
+            f"{metrics['training_ideal_vs_nonideal_accuracy']:.4f}"
+        )
+    if holdout_metrics:
+        print(f"Holdout accuracy: {holdout_metrics['test_accuracy']:.4f}")
+        print(f"Holdout balanced accuracy: {holdout_metrics['test_balanced_accuracy']:.4f}")
+        print(f"Holdout macro F1: {holdout_metrics['test_macro_f1']:.4f}")
+        print(
+            "Holdout ideal-vs-nonideal accuracy: "
+            f"{holdout_metrics['test_ideal_vs_nonideal_accuracy']:.4f}"
+        )
     print(f"Model saved to: {model_output_path}")
+    artifact_paths = bundle.get("artifact_paths") or {}
+    if artifact_paths.get("evaluation_json"):
+        print(f"Evaluation report: {artifact_paths['evaluation_json']}")
+    if artifact_paths.get("split_json"):
+        print(f"Split manifest: {artifact_paths['split_json']}")
     print("=" * 60)
 
 
@@ -550,16 +948,17 @@ def train_model(
     summary_csv_path=default_summary_csv,
     events_csv_path=default_events_csv,
     model_output_path=default_model_path,
-    random_state=42,
+    random_state=default_random_state,
     model_type=model_type_default,
     feature_set=feature_set_default,
+    test_size=default_test_size,
 ):
     datasets = _load_training_datasets(summary_csv_path, events_csv_path)
-    feature_context = _load_feature_context(summary_csv_path)
     candidate_feature_sets = _candidate_feature_sets(feature_set, datasets)
     candidate_model_types = _candidate_model_types(model_type)
+    aligned_datasets = _align_candidate_datasets(datasets, candidate_feature_sets)
 
-    reference_dataset = datasets[candidate_feature_sets[0]]
+    reference_dataset = aligned_datasets[candidate_feature_sets[0]]
     class_counts = Counter(reference_dataset["y"].tolist())
 
     _print_training_header(
@@ -568,15 +967,30 @@ def train_model(
         class_counts=class_counts,
         feature_set=feature_set,
         model_type=model_type,
+        test_size=test_size,
+        random_state=random_state,
     )
 
     if len(class_counts) < 2:
         raise ValueError("Need at least 2 classes to train a classifier.")
 
+    split_info = _build_holdout_split(
+        reference_dataset,
+        test_size=test_size,
+        random_state=random_state,
+    )
+    print(
+        "Holdout split: "
+        f"train={split_info['train_size']} "
+        f"test={split_info['test_size']} "
+        f"test_fraction={split_info['test_fraction']:.3f}"
+    )
+
     evaluated_candidates = _evaluate_training_candidates(
-        datasets=datasets,
+        datasets=aligned_datasets,
         candidate_feature_sets=candidate_feature_sets,
         candidate_model_types=candidate_model_types,
+        train_video_ids=split_info["train_video_ids"],
         random_state=random_state,
     )
 
@@ -584,16 +998,30 @@ def train_model(
         raise ValueError("No candidate models could be evaluated.")
 
     best_result = max(evaluated_candidates, key=_candidate_rank_key)
+    best_model, train_dataset, test_dataset, holdout_metrics = _fit_best_model_on_training_split(
+        best_result=best_result,
+        datasets=aligned_datasets,
+        train_video_ids=split_info["train_video_ids"],
+        test_video_ids=split_info["test_video_ids"],
+        random_state=random_state,
+    )
+    feature_context = _build_feature_context_from_dataset(
+        aligned_datasets.get("summary"),
+        split_info["train_video_ids"],
+    )
     bundle = _build_model_bundle(
         best_result=best_result,
-        datasets=datasets,
+        best_model=best_model,
         summary_csv_path=summary_csv_path,
         events_csv_path=events_csv_path,
         feature_context=feature_context,
-        random_state=random_state,
+        split_info=split_info,
+        train_dataset=train_dataset,
+        test_dataset=test_dataset,
+        holdout_metrics=holdout_metrics,
     )
     bundle = _save_model_bundle(bundle, model_output_path, evaluated_candidates)
-    _print_best_model_summary(best_result, model_output_path)
+    _print_best_model_summary(best_result, bundle, model_output_path)
 
     return bundle
 
@@ -604,6 +1032,7 @@ def _multi_model_output_paths(model_output_path=None):
         return {
             "random_forest": default_rf_model_path,
             "svm": default_svm_model_path,
+            "logistic": default_logistic_model_path,
         }
 
     root, ext = os.path.splitext(base_path)
@@ -612,6 +1041,7 @@ def _multi_model_output_paths(model_output_path=None):
     return {
         "random_forest": f"{root}_rf{ext}",
         "svm": f"{root}_svm{ext}",
+        "logistic": f"{root}_logistic{ext}",
     }
 
 
@@ -634,6 +1064,9 @@ def _print_model_comparison(requested_models, bundles, output_paths):
             f"{single_model_type}: "
             f"feature_set={bundle.get('feature_set')}, "
             f"cv_bal_acc={_format_metric(metrics.get('cv_balanced_accuracy_mean'))}, "
+            f"cv_ideal_nonideal_acc={_format_metric(metrics.get('cv_ideal_vs_nonideal_accuracy_mean'))}, "
+            f"holdout_bal_acc={_format_metric((bundle.get('evaluation') or {}).get('holdout_metrics', {}).get('test_balanced_accuracy'))}, "
+            f"holdout_ideal_nonideal_acc={_format_metric((bundle.get('evaluation') or {}).get('holdout_metrics', {}).get('test_ideal_vs_nonideal_accuracy'))}, "
             f"cv_macro_f1={_format_metric(metrics.get('cv_macro_f1_mean'))}, "
             f"train_acc={_format_metric(metrics.get('training_accuracy'))}, "
             f"path={output_paths[single_model_type]}"
@@ -645,9 +1078,10 @@ def train_models(
     summary_csv_path=default_summary_csv,
     events_csv_path=default_events_csv,
     model_output_path=default_model_path,
-    random_state=42,
+    random_state=default_random_state,
     model_type=model_type_default,
     feature_set=feature_set_default,
+    test_size=default_test_size,
 ):
     requested_models = _candidate_model_types(model_type)
     output_paths = _multi_model_output_paths(model_output_path)
@@ -666,6 +1100,7 @@ def train_models(
             random_state=random_state,
             model_type=single_model_type,
             feature_set=feature_set,
+            test_size=test_size,
         )
         bundles[single_model_type] = bundle
 
@@ -703,7 +1138,8 @@ def feature_row_from_results_dict(results_dict, feature_set="summary"):
     if feature_key == "legacy":
         flow_start = _safe_int(results_dict.get("flow_start"), default=0) or 0
         flow_end = _safe_int(results_dict.get("flow_end"), default=0) or 0
-        shot_time = max(0, flow_end - flow_start)
+        fps = safe_fps(results_dict.get("fps"), default=DEFAULT_EXTRACTION_FPS)
+        shot_time = shot_duration_seconds(flow_start, flow_end, fps)
         blonding_rate = _safe_float(results_dict.get("blond_rate"), default=0.0)
         ch_range, ch_range_norm, ch_coverage_norm = _compute_channeling_metrics(
             results_dict.get("channeling_stats")
@@ -719,6 +1155,16 @@ def feature_row_from_results_dict(results_dict, feature_set="summary"):
     feature_rows = _build_feature_rows_from_results(results_dict)
     if feature_key == "summary":
         return feature_rows["summary"]
+    if feature_key == "summary_compact":
+        return {
+            column_name: feature_rows["summary"].get(column_name)
+            for column_name in summary_compact_feature_columns
+        }
+    if feature_key == "summary_compact_best":
+        return {
+            column_name: feature_rows["summary"].get(column_name)
+            for column_name in summary_compact_best_feature_columns
+        }
     if feature_key == "events":
         return feature_rows["events"]
     if feature_key == "combined":
@@ -858,16 +1304,28 @@ def _build_arg_parser():
     )
     train_parser.add_argument("--model", default=default_model_path, help="Path to save trained model")
     train_parser.add_argument(
+        "--test-size",
+        type=float,
+        default=default_test_size,
+        help="Held-out test fraction (0-1) or absolute test count. Default: 0.2",
+    )
+    train_parser.add_argument(
+        "--random-state",
+        type=int,
+        default=default_random_state,
+        help="Random seed for the holdout split and CV reproducibility.",
+    )
+    train_parser.add_argument(
         "--model-type",
         default=model_type_default,
         choices=list(supported_model_types),
-        help="Model family to train. Use 'both' to train and save Random Forest and SVM together.",
+        help="Model family to train. Use 'all' to compare logistic, Random Forest, and SVM together; 'both' keeps the legacy Random Forest + SVM comparison.",
     )
     train_parser.add_argument(
         "--feature-set",
         default=feature_set_default,
         choices=list(supported_feature_sets),
-        help="Which exported feature set to use, or 'auto' to compare available sets.",
+        help="Which exported feature set to use, or 'auto' to compare the compact summary profiles alongside the broader exported sets.",
     )
 
     predict_parser = subparsers.add_parser("predict", help="Predict extraction class from *_results.json")
@@ -887,8 +1345,10 @@ def main():
             summary_csv_path=default_summary_csv,
             events_csv_path=default_events_csv,
             model_output_path=default_model_path,
+            random_state=default_random_state,
             model_type=model_type_default,
             feature_set=feature_set_default,
+            test_size=default_test_size,
         )
         return
 
@@ -897,8 +1357,10 @@ def main():
             summary_csv_path=args.csv,
             events_csv_path=args.events_csv,
             model_output_path=args.model,
+            random_state=args.random_state,
             model_type=args.model_type,
             feature_set=args.feature_set,
+            test_size=args.test_size,
         )
         return
 

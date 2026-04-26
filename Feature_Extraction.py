@@ -4,6 +4,13 @@ import numpy as np
 import json
 from collections import deque
 from typing import Dict, Tuple, List
+from Frame_Extraction import (
+    DEFAULT_EXTRACTION_FPS,
+    PREVIEW_FRAME_OFFSET_SECONDS,
+    safe_fps,
+    sampled_frame_offset_for_seconds,
+    shot_duration_seconds,
+)
 from Portafilter_Detection import detect_elliptical_portafilter_with_holes
 from Espresso_Diagnostics import build_combined_assessment, compute_diagnostics
 
@@ -108,11 +115,18 @@ def load_frames(folder):
     frames_gray = []
     frames = []
 
+    reference_shape = None
+
     for fname in frame_files:
         path = os.path.join(folder, fname)
         img = cv2.imread(path)
         if img is None:
             continue
+        if reference_shape is None:
+            reference_shape = img.shape[:2]
+        elif img.shape[:2] != reference_shape:
+            target_h, target_w = reference_shape
+            img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         frames.append(img)
         frames_gray.append(gray)
@@ -128,6 +142,15 @@ def build_frame_arrays(frames_bgr, frame_names=None):
     if len(frames) == 0:
         raise RuntimeError("No frames supplied for feature extraction")
 
+    reference_shape = frames[0].shape[:2]
+    normalised_frames = []
+    for frame in frames:
+        if frame.shape[:2] != reference_shape:
+            target_h, target_w = reference_shape
+            frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        normalised_frames.append(frame)
+
+    frames = normalised_frames
     frames_gray = [cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) for frame in frames]
     if frame_names is None:
         frame_names = [f"frame_{index:04d}.jpg" for index in range(len(frames))]
@@ -143,7 +166,7 @@ def detect_flow_start_end(
     smoothing_window: int = 3,
     end_lookback_window: int = 10,
     min_shot_duration_seconds: float = 5.0,
-    fps: float = 1.0,
+    fps: float = DEFAULT_EXTRACTION_FPS,
 ) -> Tuple[int, int, Dict[str, object]]:
     # Detect shot start/end from frame changes with explicit consecutive-frame rules:
     # - Start: >=2 consecutive frames above small-change threshold
@@ -228,7 +251,7 @@ def detect_flow_start_end(
     peak_idx = start_frame + peak_relative
 
     end_frame = len(frames_gray) - 1
-    fps_safe = max(1e-6, float(fps))
+    fps_safe = safe_fps(fps)
     min_required_frames = max(1, int(round(float(min_shot_duration_seconds) * fps_safe)))
     min_end_frame = min(len(frames_gray) - 1, start_frame + min_required_frames - 1)
 
@@ -1394,7 +1417,7 @@ def extract_colour_and_blonding(frames_bgr,
                                 frames_gray,
                                 start_frame,
                                 end_frame,
-                                fps=1.0,
+                                fps=DEFAULT_EXTRACTION_FPS,
                                 mask_history=None,
                                 detect_channeling=True,
                                 portafilter_ellipse=None,
@@ -1852,10 +1875,6 @@ def extract_colour_and_blonding(frames_bgr,
         "channel_lr_asymmetry_curve": channel_lr_asymmetry_curve,
         "channel_tb_asymmetry_curve": channel_tb_asymmetry_curve,
         "channel_spatial_entropy_curve": channel_spatial_entropy_curve,
-        "channel_left_density_curve": channel_left_density_curve,
-        "channel_right_density_curve": channel_right_density_curve,
-        "channel_top_density_curve": channel_top_density_curve,
-        "channel_bottom_density_curve": channel_bottom_density_curve,
         "channeling_temporal_summary": {
             "mean_holes": channel_mean,
             "std_holes": channel_std,
@@ -1918,7 +1937,8 @@ def extract_features_from_video(cropped_frames_dir=None,
                                frame_names_override=None,
                                portafilter_override_ellipse=None,
                                portafilter_override_hole_size=None,
-                               portafilter_override_fast_params=None):
+                               portafilter_override_fast_params=None,
+                               fps=DEFAULT_EXTRACTION_FPS):
     # Extract blonding and channeling features from cropped frames.
     if cropped_frames_dir is None:
         cropped_frames_dir = Crop_Dir
@@ -1937,6 +1957,7 @@ def extract_features_from_video(cropped_frames_dir=None,
         print(f"Loading frames")
         frames_bgr, frames_gray, frame_names = load_frames(cropped_frames_dir)
     print(f"Loaded {len(frames_gray)} frames")
+    fps = safe_fps(fps)
 
     H, W = frames_gray[0].shape
     roi = (0, H, 0, W)
@@ -1952,13 +1973,14 @@ def extract_features_from_video(cropped_frames_dir=None,
         smoothing_window=3,             # Smooth out noise while keeping responsiveness
         end_lookback_window=10,         # Rolling average for stable end checks
         min_shot_duration_seconds=5.0,  # End detection starts only after 5 seconds
-        fps=1.0,
+        fps=fps,
     )
 
     print("\nFlow Detection Results:")
     print(f"Flow start frame index : {start_frame}")
     print(f"Flow end frame index   : {end_frame}")
     print(f"Shot duration (frames) : {end_frame - start_frame + 1}")
+    print(f"Shot duration (seconds): {shot_duration_seconds(start_frame, end_frame, fps):.2f}")
     print(f"Start frame file       : {frame_names[start_frame]}")
     print(f"End frame file         : {frame_names[end_frame]}")
     print(f"Flow quality score     : {float(flow_metrics.get('quality_score', 0.0)):.2f}")
@@ -1974,7 +1996,10 @@ def extract_features_from_video(cropped_frames_dir=None,
         hole_mode_size = portafilter_override_hole_size
     else:
         print("Detecting portafilter ellipse for channeling detection...")
-        pf_second_idx = min(start_frame + 20, len(frames_bgr) - 1)
+        pf_second_idx = min(
+            start_frame + sampled_frame_offset_for_seconds(PREVIEW_FRAME_OFFSET_SECONDS, fps),
+            len(frames_bgr) - 1,
+        )
         pf_second_frame = frames_bgr[pf_second_idx] if pf_second_idx > start_frame else None
 
         _, portafilter_ellipse, hole_mode_size, fast_params = detect_elliptical_portafilter_with_holes(
@@ -1995,7 +2020,7 @@ def extract_features_from_video(cropped_frames_dir=None,
         frames_gray,
         start_frame=start_frame,
         end_frame=end_frame,
-        fps=1.0,
+        fps=fps,
         detect_channeling=detect_channeling,
         portafilter_ellipse=portafilter_ellipse,
         target_hole_size=hole_mode_size,
@@ -2051,10 +2076,6 @@ def extract_features_from_video(cropped_frames_dir=None,
                 "channel_lr_asymmetry_curve",
                 "channel_tb_asymmetry_curve",
                 "channel_spatial_entropy_curve",
-                "channel_left_density_curve",
-                "channel_right_density_curve",
-                "channel_top_density_curve",
-                "channel_bottom_density_curve",
             ]:
                 print(f"{k}: {v}")
         
@@ -2066,13 +2087,12 @@ def extract_features_from_video(cropped_frames_dir=None,
             "flow_start": int(start_frame),
             "flow_end": int(end_frame),
             "total_frames": len(frames_gray),
-            "fps": float(colour_results.get("fps", 1.0) or 1.0),
+            "fps": float(colour_results.get("fps", fps) or fps),
             "flow_detection": colour_results.get("flow_detection"),
             "analysis_roi": colour_results.get("analysis_roi"),
             "channel_roi_pixels": int(colour_results.get("channel_roi_pixels") or 0),
             "blond_roi_pixels": int(colour_results.get("blond_roi_pixels") or 0),
             "portafilter_ellipse": colour_results.get("portafilter_ellipse"),
-            "target_hole_size": float(hole_mode_size) if hole_mode_size is not None else None,
             "brightness_curve": to_json_curve(colour_results.get("brightness_curve")),
             "saturation_curve": to_json_curve(colour_results.get("saturation_curve")),
             "hue_curve": to_json_curve(colour_results.get("hue_curve")),
@@ -2089,10 +2109,6 @@ def extract_features_from_video(cropped_frames_dir=None,
             "channel_lr_asymmetry_curve": to_json_curve(colour_results.get("channel_lr_asymmetry_curve")),
             "channel_tb_asymmetry_curve": to_json_curve(colour_results.get("channel_tb_asymmetry_curve")),
             "channel_spatial_entropy_curve": to_json_curve(colour_results.get("channel_spatial_entropy_curve")),
-            "channel_left_density_curve": to_json_curve(colour_results.get("channel_left_density_curve")),
-            "channel_right_density_curve": to_json_curve(colour_results.get("channel_right_density_curve")),
-            "channel_top_density_curve": to_json_curve(colour_results.get("channel_top_density_curve")),
-            "channel_bottom_density_curve": to_json_curve(colour_results.get("channel_bottom_density_curve")),
             "channeling_temporal_summary": colour_results.get("channeling_temporal_summary"),
             "channeling_spatial_summary": colour_results.get("channeling_spatial_summary"),
             "channeling_quality": colour_results.get("channeling_quality"),

@@ -2,7 +2,13 @@ import os
 import cv2
 import numpy as np
 from Portafilter_Detection import detect_elliptical_portafilter_with_holes, load_image_with_orientation
-from Frame_Extraction import extract_frames
+from Frame_Extraction import (
+    DEFAULT_EXTRACTION_FPS,
+    PREVIEW_FRAME_OFFSET_SECONDS,
+    extract_frames,
+    safe_fps,
+    sampled_frame_offset_for_seconds,
+)
 
 
 Base_Dir = os.path.dirname(os.path.abspath(__file__))
@@ -277,6 +283,7 @@ def track_portafilter_motion(frames, ellipse, max_tracking_width=960):
         if score >= 0.60:
             fresh_bounds = get_centered_bounds(measured_center, template_w, template_h)
             fresh_template = crop_with_padding(tracking_grays[index], fresh_bounds)
+            fresh_template = _resize_to_shape(fresh_template, template_gray.shape)
             template_gray = cv2.addWeighted(template_gray, 0.85, fresh_template, 0.15, 0.0)
             template_updates += 1
 
@@ -305,16 +312,18 @@ def track_portafilter_motion(frames, ellipse, max_tracking_width=960):
 
 def crop_frame_locked(frame, center, reference_crop_bounds, reference_center):
     ref_x1, ref_y1, ref_x2, ref_y2 = reference_crop_bounds
+    ref_width = max(1, int(ref_x2 - ref_x1))
+    ref_height = max(1, int(ref_y2 - ref_y1))
     left_offset = float(reference_center[0] - ref_x1)
-    right_offset = float(ref_x2 - reference_center[0])
     top_offset = float(reference_center[1] - ref_y1)
-    bottom_offset = float(ref_y2 - reference_center[1])
 
+    crop_x1 = int(round(center[0] - left_offset))
+    crop_y1 = int(round(center[1] - top_offset))
     crop_bounds = (
-        int(round(center[0] - left_offset)),
-        int(round(center[1] - top_offset)),
-        int(round(center[0] + right_offset)),
-        int(round(center[1] + bottom_offset)),
+        crop_x1,
+        crop_y1,
+        crop_x1 + ref_width,
+        crop_y1 + ref_height,
     )
     return crop_with_padding(frame, crop_bounds)
 
@@ -324,6 +333,14 @@ def generate_locked_crops(frames, reference_crop_bounds, reference_center, cente
         crop_frame_locked(frame, center, reference_crop_bounds, reference_center)
         for frame, center in zip(frames, centers)
     ]
+
+
+def _resize_to_shape(image, target_shape):
+    target_h, target_w = [int(value) for value in target_shape[:2]]
+    image_h, image_w = image.shape[:2]
+    if image_h == target_h and image_w == target_w:
+        return image
+    return cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
 
 def save_locked_crops(frames, output_dir, reference_crop_bounds, reference_center, centers):
@@ -339,12 +356,22 @@ def save_locked_crops(frames, output_dir, reference_crop_bounds, reference_cente
     return crops
 
 
-def detect_reference_ellipse(frames, manual_roi=False, manual_ellipse=None, detection_max_width=1280):
+def detect_reference_ellipse(
+    frames,
+    manual_roi=False,
+    manual_ellipse=None,
+    detection_max_width=1280,
+    sampled_fps=DEFAULT_EXTRACTION_FPS,
+):
     if len(frames) == 0:
         raise RuntimeError("No frames available for detection")
 
     frame1 = frames[0]
-    frame2 = frames[min(20, len(frames) - 1)]
+    frame2_idx = min(
+        sampled_frame_offset_for_seconds(PREVIEW_FRAME_OFFSET_SECONDS, sampled_fps),
+        len(frames) - 1,
+    )
+    frame2 = frames[frame2_idx]
     detection_scale = _compute_resize_scale(frame1.shape, max_width=detection_max_width)
     inverse_scale = 1.0 / detection_scale if detection_scale > 0 else 1.0
     frame1_working = _resize_frame(frame1, detection_scale)
@@ -384,12 +411,14 @@ def process_portafilter_tracking_v2(
     return_crops=False,
     detection_max_width=1280,
     tracking_max_width=960,
+    sampled_fps=DEFAULT_EXTRACTION_FPS,
 ):
     if frames_dir is None:
         frames_dir = Input_Dir
     if output_dir is None:
         output_dir = Crop_Dir
 
+    sampled_fps = safe_fps(sampled_fps)
     if frames is None:
         frame_files = list_frame_files(frames_dir)
         if not frame_files:
@@ -402,7 +431,11 @@ def process_portafilter_tracking_v2(
         raise RuntimeError("Not enough frames for tracking")
 
     reference_frame = frames[0]
-    second_frame = frames[min(20, len(frames) - 1)]
+    second_frame_idx = min(
+        sampled_frame_offset_for_seconds(PREVIEW_FRAME_OFFSET_SECONDS, sampled_fps),
+        len(frames) - 1,
+    )
+    second_frame = frames[second_frame_idx]
 
     if manual_ellipse is not None:
         ellipse = manual_ellipse
@@ -425,6 +458,7 @@ def process_portafilter_tracking_v2(
             manual_roi=manual_roi,
             manual_ellipse=manual_ellipse,
             detection_max_width=detection_max_width,
+            sampled_fps=sampled_fps,
         )
 
     crop_bounds = get_crop_bounds(reference_frame.shape, ellipse, padding=12)
@@ -482,6 +516,7 @@ def process_portafilter_tracking_v2(
         "fast_params": fast_params,
         "output_dir": output_dir,
         "frame_count": len(frames),
+        "fps": sampled_fps,
         "stabilisation": {
             "method": "roi_template_lock",
             "average_match_score": tracking["average_match_score"],
@@ -512,7 +547,7 @@ def run_tracking_v2_on_video(
     video_path,
     frames_dir=None,
     output_dir=None,
-    target_fps=1,
+    target_fps=DEFAULT_EXTRACTION_FPS,
     clear_dirs=True,
 ):
     if not os.path.isfile(video_path):
@@ -531,7 +566,8 @@ def run_tracking_v2_on_video(
         _clear_image_files(output_dir)
 
     print(f"Extracting frames from: {video_path}")
-    frame_count = extract_frames(video_path, frames_dir, target_fps=max(1, float(target_fps)))
+    target_fps = safe_fps(target_fps)
+    frame_count = extract_frames(video_path, frames_dir, target_fps=target_fps)
     print(f"Extracted {frame_count} frames to: {frames_dir}")
 
     result = process_portafilter_tracking_v2(
@@ -540,6 +576,7 @@ def run_tracking_v2_on_video(
         manual_roi=False,
         manual_ellipse=None,
         stabilise_before_detection=True,
+        sampled_fps=target_fps,
     )
     return result
 
@@ -551,7 +588,7 @@ if __name__ == "__main__":
     parser.add_argument("--video", type=str, default="", help="Path to input video for modular test")
     parser.add_argument("--frames-dir", type=str, default=Input_Dir, help="Working extracted frames directory")
     parser.add_argument("--output-dir", type=str, default=Crop_Dir, help="Output cropped frames directory")
-    parser.add_argument("--target-fps", type=float, default=1.0, help="Frame extraction fps")
+    parser.add_argument("--target-fps", type=float, default=DEFAULT_EXTRACTION_FPS, help="Frame extraction fps")
     parser.add_argument("--no-clear", action="store_true", help="Keep existing extracted/cropped images")
     args = parser.parse_args()
 
@@ -560,7 +597,7 @@ if __name__ == "__main__":
             video_path=args.video,
             frames_dir=args.frames_dir,
             output_dir=args.output_dir,
-            target_fps=max(1.0, args.target_fps),
+            target_fps=safe_fps(args.target_fps),
             clear_dirs=not args.no_clear,
         )
     else:

@@ -3,6 +3,8 @@ import math
 from functools import lru_cache
 from pathlib import Path
 
+from Frame_Extraction import DEFAULT_EXTRACTION_FPS, safe_fps, shot_duration_seconds
+
 
 RULES_PATH = Path(__file__).with_name("espresso_diagnostic_rules.json")
 
@@ -143,10 +145,10 @@ def _make_flag(rule, score, stats, flag_scores):
 
 
 def compute_diagnostic_statistics(results_dict):
-    fps = max(_safe_float(results_dict.get("fps"), 1.0), 1.0)
+    fps = safe_fps(_safe_float(results_dict.get("fps"), DEFAULT_EXTRACTION_FPS), default=DEFAULT_EXTRACTION_FPS)
     flow_start = _safe_int(results_dict.get("flow_start"), 0)
     flow_end = _safe_int(results_dict.get("flow_end"), flow_start)
-    shot_time_s = max(0.0, (flow_end - flow_start + 1) / fps)
+    shot_time_s = shot_duration_seconds(flow_start, flow_end, fps)
 
     flow_detection = results_dict.get("flow_detection") or {}
     spatial = results_dict.get("channeling_spatial_summary") or {}
