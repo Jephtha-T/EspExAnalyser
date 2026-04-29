@@ -310,7 +310,7 @@ def track_portafilter_motion(frames, ellipse, max_tracking_width=960):
     }
 
 
-def crop_frame_locked(frame, center, reference_crop_bounds, reference_center):
+def get_locked_crop_bounds(center, reference_crop_bounds, reference_center):
     ref_x1, ref_y1, ref_x2, ref_y2 = reference_crop_bounds
     ref_width = max(1, int(ref_x2 - ref_x1))
     ref_height = max(1, int(ref_y2 - ref_y1))
@@ -325,6 +325,11 @@ def crop_frame_locked(frame, center, reference_crop_bounds, reference_center):
         crop_x1 + ref_width,
         crop_y1 + ref_height,
     )
+    return crop_bounds
+
+
+def crop_frame_locked(frame, center, reference_crop_bounds, reference_center):
+    crop_bounds = get_locked_crop_bounds(center, reference_crop_bounds, reference_center)
     return crop_with_padding(frame, crop_bounds)
 
 
@@ -517,6 +522,12 @@ def process_portafilter_tracking_v2(
         "output_dir": output_dir,
         "frame_count": len(frames),
         "fps": sampled_fps,
+        "crop_bounds": tuple(int(value) for value in crop_bounds),
+        "reference_center": tuple(float(value) for value in reference_center),
+        "crop_centers": [
+            (float(center[0]), float(center[1]))
+            for center in crop_centers
+        ],
         "stabilisation": {
             "method": "roi_template_lock",
             "average_match_score": tracking["average_match_score"],

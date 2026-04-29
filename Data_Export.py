@@ -702,7 +702,6 @@ def export_to_csv(analysis_dir, output_file="training_data.csv"):
 
 
 if __name__ == "__main__":
-    # Example usage.
     base_dir = os.path.dirname(os.path.abspath(__file__))
     analysis_dir = os.path.join(base_dir, "Analysis")
     export_to_csv(analysis_dir, output_file="training_data.csv")

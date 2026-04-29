@@ -7,8 +7,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+import cv2
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from Espresso_Analysis import (
@@ -21,12 +24,20 @@ from Espresso_Analysis import (
     run_full_analysis,
 )
 from Frame_Extraction import DEFAULT_EXTRACTION_FPS, safe_fps, shot_duration_seconds
+from Espresso_Model import (
+    default_logistic_model_path,
+    default_model_path,
+    default_rf_model_path,
+    default_svm_model_path,
+    predict_from_results_dict,
+)
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 API_STORAGE_DIR = os.path.join(BASE_DIR, "api_storage")
 SESSIONS_DIR = os.path.join(API_STORAGE_DIR, "sessions")
 STAGE_TOTAL = 7
+MOBILE_FRAMES_DIR_NAME = "mobile_replay_frames"
 
 
 def _utc_now_iso():
@@ -36,6 +47,30 @@ def _utc_now_iso():
 def _safe_remove_tree(path):
     if os.path.isdir(path):
         shutil.rmtree(path, ignore_errors=True)
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return _json_safe(value.item())
+        except Exception:
+            pass
+    if hasattr(value, "tolist"):
+        try:
+            return _json_safe(value.tolist())
+        except Exception:
+            pass
+    return str(value)
 
 
 @dataclass
@@ -85,9 +120,7 @@ class AnalysisSession:
         if self.results_payload:
             payload.update(self.results_payload)
             payload["result_payload"] = self.results_payload
-        if self.raw_results_json:
-            payload["results_json"] = self.raw_results_json
-        return payload
+        return _json_safe(payload)
 
 
 class StartAnalysisRequest(BaseModel):
@@ -146,6 +179,60 @@ def _session_workspace(session: AnalysisSession):
     return build_workspace(session.root_dir, include_video_dir=False)
 
 
+def _predict_extraction_class(results_json: dict[str, Any]):
+    for model_path in (
+        default_model_path,
+        default_rf_model_path,
+        default_svm_model_path,
+        default_logistic_model_path,
+    ):
+        if not os.path.isfile(model_path):
+            continue
+        try:
+            prediction = predict_from_results_dict(results_json, model_path=model_path)
+            prediction["model_path"] = model_path
+            return prediction
+        except Exception:
+            traceback.print_exc()
+    return None
+
+
+def _save_mobile_replay_frames(session: AnalysisSession, run_output: dict[str, Any]):
+    feature_results = run_output.get("feature_results") or {}
+    frames = feature_results.get("channeling_frames") or []
+    if not frames:
+        return {}
+
+    frames_dir = os.path.join(session.root_dir, MOBILE_FRAMES_DIR_NAME)
+    os.makedirs(frames_dir, exist_ok=True)
+
+    frame_urls = []
+    frame_width = None
+    frame_height = None
+    for index, frame in enumerate(frames):
+        if frame is None:
+            continue
+        if frame_height is None or frame_width is None:
+            frame_height, frame_width = frame.shape[:2]
+        filename = f"frame_{index:04d}.jpg"
+        path = os.path.join(frames_dir, filename)
+        cv2.imwrite(path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        frame_urls.append(
+            f"/api/analyse-video/frame?job_id={session.session_id}&name={filename}"
+        )
+
+    if not frame_urls:
+        return {}
+
+    return {
+        "replay_frame_urls": frame_urls,
+        "replay_frame_count": len(frame_urls),
+        "replay_frame_width": int(frame_width or 0),
+        "replay_frame_height": int(frame_height or 0),
+        "replay_frame_kind": "channeling_overlay",
+    }
+
+
 def _build_results_payload(session: AnalysisSession, run_output: dict[str, Any]):
     results_json = run_output.get("results_json") or {}
     feature_results = run_output.get("feature_results") or {}
@@ -156,7 +243,9 @@ def _build_results_payload(session: AnalysisSession, run_output: dict[str, Any])
     shot_time_seconds = shot_duration_seconds(start_frame, end_frame, fps)
 
     quality = results_json.get("quality") or {}
-    model_prediction = results_json.get("model_prediction") or {}
+    model_prediction = results_json.get("model_prediction")
+    if model_prediction is None:
+        model_prediction = _predict_extraction_class(results_json)
     diagnostics = results_json.get("diagnostics") or {}
     combined_assessment = results_json.get("combined_assessment") or {}
     confidence = model_prediction.get("confidence")
@@ -175,16 +264,28 @@ def _build_results_payload(session: AnalysisSession, run_output: dict[str, Any])
         "confidence": float(confidence or 0.0),
         "quality_score": float(quality.get("overall_score", 0.0)) * 10.0,
         "brightness_curve": results_json.get("brightness_curve") or feature_results.get("brightness_curve") or [],
+        "hue_curve": results_json.get("hue_curve") or feature_results.get("hue_curve") or [],
+        "saturation_curve": results_json.get("saturation_curve") or feature_results.get("saturation_curve") or [],
         "channeling_counts": results_json.get("channeling_counts") or feature_results.get("channeling_counts") or [],
+        "channeling_norm_curve": results_json.get("channeling_norm_curve")
+        or feature_results.get("channeling_norm_curve")
+        or [],
         "roi_source": session.approved_roi_source or "auto",
         "analysis_roi": results_json.get("analysis_roi"),
         "portafilter_ellipse": results_json.get("portafilter_ellipse")
         or ellipse_to_dict(tracking_result.get("ellipse_in_crop")),
+        "channeling_stats": results_json.get("channeling_stats")
+        or feature_results.get("channeling_stats"),
+        "channeling_quality": results_json.get("channeling_quality")
+        or feature_results.get("channeling_quality"),
+        "channeling_temporal_summary": results_json.get("channeling_temporal_summary")
+        or feature_results.get("channeling_temporal_summary"),
+        "channeling_spatial_summary": results_json.get("channeling_spatial_summary")
+        or feature_results.get("channeling_spatial_summary"),
         "diagnostics": diagnostics,
         "quality": quality,
         "model_prediction": model_prediction,
         "combined_assessment": combined_assessment,
-        "tracking": tracking_result,
         "results_json_path": run_output.get("results_json_path"),
     }
 
@@ -194,6 +295,8 @@ def _build_results_payload(session: AnalysisSession, run_output: dict[str, Any])
             session.frame_width,
             session.frame_height,
         )
+
+    payload.update(_save_mobile_replay_frames(session, run_output))
 
     return payload
 
@@ -227,7 +330,7 @@ def _run_analysis_worker(session_id: str):
                 if session.approved_roi_source == "auto" and session.preview
                 else None
             ),
-            capture_channeling_frames=False,
+            capture_channeling_frames=True,
             progress_callback=progress_callback,
             save_crops_to_disk=False,
         )
@@ -294,7 +397,11 @@ async def upload_video(video: UploadFile = File(...), source: str = "mobile_app"
         _sessions[session_id] = session
 
     try:
-        review = prepare_video_review(stored_video_path, workspace)
+        review = await run_in_threadpool(
+            prepare_video_review,
+            stored_video_path,
+            workspace,
+        )
     except Exception as exc:
         _safe_remove_tree(session_root)
         with _sessions_lock:
@@ -389,6 +496,16 @@ def start_analysis(request: StartAnalysisRequest):
 def analysis_status(job_id: str):
     session = _get_session_or_404(job_id)
     return session.to_dict()
+
+
+@app.get("/api/analyse-video/frame")
+def analysis_frame(job_id: str, name: str):
+    session = _get_session_or_404(job_id)
+    safe_name = os.path.basename(name)
+    frame_path = os.path.join(session.root_dir, MOBILE_FRAMES_DIR_NAME, safe_name)
+    if not os.path.isfile(frame_path):
+        raise HTTPException(status_code=404, detail={"message": "Frame not found."})
+    return FileResponse(frame_path, media_type="image/jpeg")
 
 
 if __name__ == "__main__":

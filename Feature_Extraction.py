@@ -14,12 +14,44 @@ from Frame_Extraction import (
 from Portafilter_Detection import detect_elliptical_portafilter_with_holes
 from Espresso_Diagnostics import build_combined_assessment, compute_diagnostics
 
-# Helpers
-
 Base_Dir = os.path.dirname(os.path.abspath(__file__))
 Crop_Dir = os.path.join(Base_Dir, "Image Data", "Cropped")
 Output_Dir = os.path.join(Base_Dir, "Analysis")
 os.makedirs(Output_Dir, exist_ok=True)
+
+
+def predict_extraction_class(results_json):
+    try:
+        from Espresso_Model import (
+            default_logistic_model_path,
+            default_model_path,
+            default_rf_model_path,
+            default_svm_model_path,
+            predict_from_results_dict,
+        )
+    except Exception as import_error:
+        print(f"Model prediction skipped: {import_error}")
+        return None
+
+    for model_path in (
+        default_model_path,
+        default_rf_model_path,
+        default_svm_model_path,
+        default_logistic_model_path,
+    ):
+        if not os.path.exists(model_path):
+            continue
+        try:
+            prediction = predict_from_results_dict(
+                results_json,
+                model_path=model_path,
+            )
+            prediction["model_path"] = model_path
+            return prediction
+        except Exception as prediction_error:
+            print(f"Model prediction failed for {os.path.basename(model_path)}: {prediction_error}")
+
+    return None
 
 
 def filter_keypoints_by_size(keypoints, keypoint_sizes, target_size, tolerance=5):
@@ -101,7 +133,6 @@ def detect_fast_circles(image, threshold=25, min_circularity=0.4):
             filtered_keypoints.append(keypoint)
             keypoint_sizes.append(size)
         except Exception:
-            # Keep prior behavior: skip points that fail contour validation.
             continue
 
     return filtered_keypoints, keypoint_sizes
@@ -1026,25 +1057,20 @@ def detect_channeling_in_frame(
     fast_params=None,
     analysis_rect=None,
 ):
-    # Count visible holes inside the portafilter ellipse region.
-    # Use FAST parameters from portafilter detection to ensure consistency
     if fast_params is None:
         fast_params = {'threshold': 15, 'min_circularity': 0.4, 'size_tolerance': 5}
     
     frame_h, frame_w = frame_gray.shape
-    # Channeling intentionally ignores the triangle and stays ellipse-only.
     roi_mask = make_channeling_roi_mask(
         (frame_h, frame_w),
         portafilter_ellipse=portafilter_ellipse,
     )
 
     if roi_mask is not None:
-        # Apply mask to image - zeros out everything outside ROI
         masked_frame = cv2.bitwise_and(frame_gray, frame_gray, mask=roi_mask)
     else:
         masked_frame = frame_gray
     
-    # Detect circular features (holes) using exact FAST params from portafilter detection.
     keypoints, keypoint_sizes = detect_fast_circles(
         masked_frame, 
         threshold=fast_params['threshold'],
@@ -1052,14 +1078,12 @@ def detect_channeling_in_frame(
     )
     raw_count = int(len(keypoints))
     
-    # Filter keypoints to only those inside the ROI.
     if roi_mask is not None and len(keypoints) > 0:
         filtered_by_roi = []
         filtered_sizes_by_roi = []
 
         for kp, size in zip(keypoints, keypoint_sizes):
             x, y = int(kp.pt[0]), int(kp.pt[1])
-            # Keep only keypoints that are inside the analysis ROI
             if 0 <= y < frame_h and 0 <= x < frame_w and roi_mask[y, x] == 255:
                 filtered_by_roi.append(kp)
                 filtered_sizes_by_roi.append(size)
@@ -1068,7 +1092,6 @@ def detect_channeling_in_frame(
         keypoint_sizes = filtered_sizes_by_roi
     roi_filtered_count = int(len(keypoints))
     
-    # Filter to target hole size using the same tolerance from portafilter detection
     if target_hole_size is not None and len(keypoints) > 0:
         filtered_keypoints = filter_keypoints_by_size(
             keypoints, 
@@ -1077,7 +1100,6 @@ def detect_channeling_in_frame(
             tolerance=fast_params['size_tolerance']
         )
         if len(filtered_keypoints) == 0:
-            # Keep the overlay usable even when detected point sizes drift briefly.
             filtered_keypoints = keypoints
     else:
         filtered_keypoints = keypoints
@@ -2034,7 +2056,6 @@ def extract_features_from_video(cropped_frames_dir=None,
         colour_results["flow_detection"] = flow_metrics
 
         def to_json_curve(values):
-            # Convert numpy-heavy arrays to plain JSON-safe lists.
             if values is None:
                 return []
             serialised = []
@@ -2079,7 +2100,6 @@ def extract_features_from_video(cropped_frames_dir=None,
             ]:
                 print(f"{k}: {v}")
         
-        # Save results as JSON
         results_json = {
             "video_name": video_name,
             "blond_frame": int(colour_results["blond_frame"]) if colour_results.get("blond_frame") is not None else None,
@@ -2147,18 +2167,7 @@ def extract_features_from_video(cropped_frames_dir=None,
         }
         colour_results["quality"] = results_json["quality"]
 
-        model_prediction = None
-        try:
-            from Espresso_Model import default_model_path, predict_from_results_dict
-
-            if os.path.exists(default_model_path):
-                model_prediction = predict_from_results_dict(
-                    results_json,
-                    model_path=default_model_path,
-                )
-        except Exception as prediction_error:
-            print(f"Model prediction skipped: {prediction_error}")
-
+        model_prediction = predict_extraction_class(results_json)
         results_json["model_prediction"] = model_prediction
         colour_results["model_prediction"] = model_prediction
 
@@ -2183,8 +2192,7 @@ def extract_features_from_video(cropped_frames_dir=None,
 
 if __name__ == "__main__":
     import sys
-    
-    # Allow command-line usage
+
     video_name = "test2"
     cropped_dir =  None
     

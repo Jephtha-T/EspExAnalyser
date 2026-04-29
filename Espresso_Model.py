@@ -434,14 +434,12 @@ def _build_holdout_split(dataset, test_size=default_test_size, random_state=defa
         random_state=random_state,
     )
 
-    train_counter = Counter(
-        dataset["y"][dataset["video_ids"].index(video_id)]
-        for video_id in train_ids
-    )
-    test_counter = Counter(
-        dataset["y"][dataset["video_ids"].index(video_id)]
-        for video_id in test_ids
-    )
+    label_by_video_id = {
+        str(video_id): int(dataset["y"][index])
+        for index, video_id in enumerate(dataset["video_ids"])
+    }
+    train_counter = Counter(label_by_video_id[video_id] for video_id in train_ids)
+    test_counter = Counter(label_by_video_id[video_id] for video_id in test_ids)
 
     return {
         "train_video_ids": [str(video_id) for video_id in train_ids],

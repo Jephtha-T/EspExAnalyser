@@ -17,18 +17,18 @@ This project is designed for users who want to run espresso shot analysis on rec
 
 ## What You Need
 
-- Windows with Python 3.10 or newer
+- Python 3.10 or newer on Windows, macOS, or Linux
 - a folder of espresso extraction videos
 - the required Python packages installed
 
 Install the dependencies from inside the project folder:
 
 ```bash
-pip install opencv-python numpy matplotlib pillow scikit-learn joblib pandas openpyxl ultralytics
+pip install -r requirements.txt
 ```
 
 Notes:
-- `tkinter` is required for the desktop interface and is usually included with Python on Windows.
+- `tkinter` is required for the desktop interface and is usually included with Python on Windows and macOS. On some Linux distributions it may need to be installed through the system package manager.
 - If `ultralytics` is not installed, the app may still run, but the YOLO-based portafilter detection path will not be available.
 
 ## Project Layout
@@ -41,12 +41,14 @@ The folders you will use most are:
 - `Analysis/results/` for saved JSON results
 - `Analysis/` for exported CSV files
 
+All runtime folders are created relative to the `EspExAnalyser` source folder, so the project can be moved to another computer without editing paths in the code. Generated folders such as `Video Data/`, `Image Data/`, `Analysis/`, and `api_storage/` are ignored by git.
+
 ## How To Run
 
 From the `EspExAnalyser` folder:
 
 ```bash
-python Espresso_Analysis.py
+python Desktop_Runner.py
 ```
 
 When the app opens:
@@ -68,6 +70,16 @@ For the smoothest experience:
 3. Use manual correction on any shots where the basket is not detected cleanly.
 4. Once the setup looks reliable, use batch mode for larger runs.
 5. Export CSV data after you have collected enough labelled results.
+
+## Optional Dataset Import
+
+If you use `Sync_Dataset.py` to import Microsoft Forms data, pass machine-specific folders at runtime instead of editing the script:
+
+```bash
+python Sync_Dataset.py --source-video-dir "path/to/source/videos" --forms-xlsx "path/to/forms.xlsx"
+```
+
+Local outputs default to `Video Data/`, `dataset.csv`, and `Video Data/_forms_imported.json` inside the project folder. The same paths can also be supplied with `ESPEX_SOURCE_VIDEO_DIR`, `ESPEX_FORMS_XLSX`, `ESPEX_VIDEO_DATA_DIR`, `ESPEX_DATASET_CSV`, and `ESPEX_IMPORT_MANIFEST`.
 
 ## Output Files
 

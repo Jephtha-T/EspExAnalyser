@@ -6,11 +6,13 @@ import subprocess
 import numpy as np
 
 Base_Dir = os.path.dirname(os.path.abspath(__file__))
-Video_Path_Default = os.path.join(Base_Dir, "Video Data/test1.mp4")
-Frame_Dir = os.path.join(Base_Dir, "Image Data/Frames")
+Video_Dir = os.path.join(Base_Dir, "Video Data")
+Video_Path_Default = os.path.join(Video_Dir, "test1.mp4")
+Frame_Dir = os.path.join(Base_Dir, "Image Data", "Frames")
 DEFAULT_EXTRACTION_FPS = 1.0
 PREVIEW_FRAME_OFFSET_SECONDS = 10.0
 Frame_Rate = DEFAULT_EXTRACTION_FPS
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv", ".webm")
 
 os.makedirs(Frame_Dir, exist_ok=True)
 
@@ -70,13 +72,24 @@ def estimated_sample_count(total_frames, source_fps, target_fps=DEFAULT_EXTRACTI
     last_frame_time_s = max(0.0, float(total_frames - 1) / source_fps)
     return int(math.floor(last_frame_time_s * target_fps + 1e-9)) + 1
 
+
 def preprocess_frame(frame):
-    # 1. Auto-rotation correction
     h, w = frame.shape[:2]
-    if w > h:  # Landscape → rotate to portrait
+    if w > h:
         frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
     return frame
+
+
+def find_default_video_path():
+    if os.path.isfile(Video_Path_Default):
+        return Video_Path_Default
+    if os.path.isdir(Video_Dir):
+        for name in sorted(os.listdir(Video_Dir)):
+            path = os.path.join(Video_Dir, name)
+            if os.path.isfile(path) and name.lower().endswith(VIDEO_EXTENSIONS):
+                return path
+    return Video_Path_Default
 
 
 def _get_video_sampling_info(video_path, target_fps=DEFAULT_EXTRACTION_FPS):
@@ -242,7 +255,6 @@ def _extract_frames_ffmpeg(video_path, output_dir, target_fps=DEFAULT_EXTRACTION
 
 
 def extract_frames(video_path, output_dir, target_fps=DEFAULT_EXTRACTION_FPS):
-    # Extract frames at a fixed frame rate.
     os.makedirs(output_dir, exist_ok=True)
     target_fps = safe_fps(target_fps)
 
@@ -251,13 +263,13 @@ def extract_frames(video_path, output_dir, target_fps=DEFAULT_EXTRACTION_FPS):
         return ffmpeg_result
     return _extract_frames_opencv(video_path, output_dir, target_fps=target_fps)
 
+
 if __name__ == "__main__":
     import sys
-    
-    # Allow command-line usage  
-    video_path = sys.argv[1] if len(sys.argv) > 1 else Video_Path_Default
+
+    video_path = sys.argv[1] if len(sys.argv) > 1 else find_default_video_path()
     output_dir = sys.argv[2] if len(sys.argv) > 2 else Frame_Dir
     fps = float(sys.argv[3]) if len(sys.argv) > 3 else Frame_Rate
-    
+
     print(f"Extracting frames from: {video_path}")
     extract_frames(video_path, output_dir, target_fps=fps)

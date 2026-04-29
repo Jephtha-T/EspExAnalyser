@@ -19,6 +19,7 @@ from Espresso_Analysis import (
     run_full_analysis,
 )
 from Frame_Extraction import DEFAULT_EXTRACTION_FPS, safe_fps, shot_duration_seconds
+from Portafilter_Tracking_v2 import get_locked_crop_bounds
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 workspace = build_workspace(base_dir)
@@ -28,6 +29,7 @@ cropped_dir = workspace.cropped_dir
 analysis_dir = workspace.analysis_dir
 
 video_exts = (".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv")
+image_exts = (".jpg", ".jpeg", ".png")
 
 
 def list_video_files(video_dir):
@@ -39,6 +41,82 @@ def list_video_files(video_dir):
         if os.path.isfile(os.path.join(video_dir, fname))
         and fname.lower().endswith(video_exts)
     ]
+
+
+def list_image_files(image_dir):
+    if not os.path.isdir(image_dir):
+        return []
+    return [
+        os.path.join(image_dir, fname)
+        for fname in sorted(os.listdir(image_dir))
+        if os.path.isfile(os.path.join(image_dir, fname))
+        and fname.lower().endswith(image_exts)
+    ]
+
+
+def paste_crop_on_full_frame(full_frame, crop_frame, crop_bounds):
+    if full_frame is None or crop_frame is None:
+        return full_frame
+
+    if len(crop_frame.shape) == 2 and len(full_frame.shape) == 3:
+        crop_frame = cv2.cvtColor(crop_frame, cv2.COLOR_GRAY2BGR)
+
+    x1, y1, x2, y2 = [int(value) for value in crop_bounds]
+    target_w = max(1, x2 - x1)
+    target_h = max(1, y2 - y1)
+    if crop_frame.shape[1] != target_w or crop_frame.shape[0] != target_h:
+        crop_frame = cv2.resize(crop_frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+    full_h, full_w = full_frame.shape[:2]
+    dst_x1 = max(0, x1)
+    dst_y1 = max(0, y1)
+    dst_x2 = min(full_w, x2)
+    dst_y2 = min(full_h, y2)
+    if dst_x1 >= dst_x2 or dst_y1 >= dst_y2:
+        return full_frame
+
+    src_x1 = dst_x1 - x1
+    src_y1 = dst_y1 - y1
+    src_x2 = src_x1 + (dst_x2 - dst_x1)
+    src_y2 = src_y1 + (dst_y2 - dst_y1)
+
+    merged = full_frame.copy()
+    merged[dst_y1:dst_y2, dst_x1:dst_x2] = crop_frame[src_y1:src_y2, src_x1:src_x2]
+    return merged
+
+
+def project_replay_frames_to_full_frame(frames_dir, tracking_result, feature_results):
+    frame_paths = list_image_files(frames_dir)
+    crop_bounds = tracking_result.get("crop_bounds")
+    reference_center = tracking_result.get("reference_center")
+    centers = tracking_result.get("crop_centers") or []
+    if not frame_paths or not crop_bounds or not reference_center or not centers:
+        return False
+
+    start_frame = int(feature_results.get("start_frame", 0) or 0)
+
+    def project_sequence(crop_frames):
+        full_frames = []
+        for index, crop_frame in enumerate(crop_frames or []):
+            source_index = start_frame + 1 + index
+            if source_index >= len(frame_paths) or source_index >= len(centers):
+                break
+
+            full_frame = cv2.imread(frame_paths[source_index])
+            if full_frame is None:
+                continue
+
+            bounds = get_locked_crop_bounds(centers[source_index], crop_bounds, reference_center)
+            full_frames.append(paste_crop_on_full_frame(full_frame, crop_frame, bounds))
+        return full_frames
+
+    channeling_frames = project_sequence(feature_results.get("channeling_frames"))
+    stream_mask_frames = project_sequence(feature_results.get("stream_mask_frames"))
+    if channeling_frames:
+        feature_results["channeling_frames"] = channeling_frames
+    if stream_mask_frames:
+        feature_results["stream_mask_frames"] = stream_mask_frames
+    return bool(channeling_frames or stream_mask_frames)
 
 
 def clear_image_data():
@@ -513,10 +591,17 @@ class EspressoAnalysisApp:
             f"Video: {video_name}",
             f"Blonding frame: {blond_frame}",
         ]
-        if model_prediction.get("predicted_label"):
-            prediction_text = f"ML prediction: {model_prediction['predicted_label']}"
+        predicted_label = model_prediction.get("predicted_label")
+        predicted_class = model_prediction.get("predicted_class")
+        if predicted_label or predicted_class is not None:
+            prediction_text = f"ML prediction: {predicted_label or 'class prediction'}"
+            prediction_details = []
+            if predicted_class is not None:
+                prediction_details.append(f"class {predicted_class}")
             if model_prediction.get("confidence") is not None:
-                prediction_text += f" ({float(model_prediction['confidence']):.2f})"
+                prediction_details.append(f"confidence {float(model_prediction['confidence']):.2f}")
+            if prediction_details:
+                prediction_text += f" ({', '.join(prediction_details)})"
             lines.append(prediction_text)
         if spatial_summary.get("dominant_quadrant"):
             lines.append(f"Dominant channeling quadrant: {spatial_summary['dominant_quadrant']}")
@@ -553,8 +638,13 @@ class EspressoAnalysisApp:
         if quality.get("overall_score") is not None:
             footer_parts.append(f"Quality score: {float(quality.get('overall_score', 0.0)):.2f}")
         prediction = feature_results.get("model_prediction") or {}
-        if prediction.get("predicted_label"):
-            footer_parts.append(f"Prediction: {prediction['predicted_label']}")
+        predicted_label = prediction.get("predicted_label")
+        predicted_class = prediction.get("predicted_class")
+        if predicted_label or predicted_class is not None:
+            prediction_text = f"Prediction: {predicted_label or 'class prediction'}"
+            if predicted_class is not None:
+                prediction_text += f" (class {predicted_class})"
+            footer_parts.append(prediction_text)
         return " | ".join(footer_parts)
 
     def _normalise_export_name(self, name):
@@ -1102,6 +1192,11 @@ class EspressoAnalysisApp:
                 approved_mode_size=manual_mode_size,
                 approved_fast_params=manual_fast_params,
                 capture_channeling_frames=True,
+            )
+            project_replay_frames_to_full_frame(
+                workspace.frames_dir,
+                run_output["tracking_result"],
+                run_output["feature_results"],
             )
             self.root.after(
                 0,

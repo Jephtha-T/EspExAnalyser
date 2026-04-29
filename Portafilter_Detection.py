@@ -12,7 +12,7 @@ from matplotlib.widgets import Button
 import matplotlib.patches as mpatches
 
 Base_Dir = os.path.dirname(os.path.abspath(__file__))
-Frame_Dir = os.path.join(Base_Dir, "Image Data/Frames")
+Frame_Dir = os.path.join(Base_Dir, "Image Data", "Frames")
 _YOLO_MODEL_CACHE = {"path": None, "model": None, "load_error": None}
 FAST_THRESHOLD_DEFAULT = 15
 FAST_MIN_CIRCULARITY_DEFAULT = 0.4
@@ -403,84 +403,66 @@ def detect_fast_circles(image, threshold=25, min_circularity=0.4):
     return filtered_keypoints, keypoint_sizes
 
 def create_interactive_dashboard(images_dict):
-    # Convert dictionary to list for easier navigation
     step_names = list(images_dict.keys())
     images = list(images_dict.values())
     current_index = 0
     
-    # Create figure for slideshow with more space for buttons
     fig, ax = plt.subplots(figsize=(12, 9))
     fig.suptitle('Portafilter Detection Pipeline - Slideshow', fontsize=16, fontweight='bold')
     
-    # Enable zoom and pan functionality
     ax.set_navigate(True)
     
     def update_slide():
-        # Update the current slide.
         ax.clear()
         
-        # Get current image and name
         img = images[current_index]
         step_name = step_names[current_index]
         
-        # Convert image to RGB if needed
         if len(img.shape) == 3 and img.shape[2] == 3:
-            # BGR to RGB conversion for OpenCV images
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         elif len(img.shape) == 2:
-            # Grayscale to RGB
             img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
         else:
             img_rgb = img
         
-        # Display image
         ax.imshow(img_rgb)
         ax.set_title(f'{step_name} ({current_index + 1}/{len(images)})', fontsize=14, fontweight='bold')
         ax.axis('off')
         
-        # Update navigation info
         nav_text.set_text(f'Step {current_index + 1} of {len(images)}: {step_name}')
         
         plt.draw()
     
     def next_slide(event):
-        # Go to the next slide.
         nonlocal current_index
         current_index = (current_index + 1) % len(images)
         update_slide()
     
     def prev_slide(event):
-        # Go to the previous slide.
         nonlocal current_index
         current_index = (current_index - 1) % len(images)
         update_slide()
     
-    # Create smaller navigation buttons positioned to avoid image overlap
     button_height = 0.04
     button_width = 0.08
     
-    # Previous button - bottom left
     prev_ax = plt.axes((0.05, 0.02, button_width, button_height))
-    prev_button = Button(prev_ax, '← Previous', color='lightgray', hovercolor='lightblue')
+    prev_button = Button(prev_ax, '< Previous', color='lightgray', hovercolor='lightblue')
     prev_button.on_clicked(prev_slide)
     
-    # Next button - bottom right
     next_ax = plt.axes((0.87, 0.02, button_width, button_height))
-    next_button = Button(next_ax, 'Next →', color='lightgray', hovercolor='lightblue')
+    next_button = Button(next_ax, 'Next >', color='lightgray', hovercolor='lightblue')
     next_button.on_clicked(next_slide)
     
-    # Navigation info text - top left
     nav_text = fig.text(0.02, 0.95, '', fontsize=10, 
                        bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
     
-    # Instructions text - top right
-    fig.text(0.98, 0.95, 'Navigation: ← → arrow keys\n'
+    fig.text(0.98, 0.95, 'Navigation: left/right arrow keys\n'
              'Zoom: Mouse wheel\n'
              'Pan: Click and drag', 
              fontsize=8, style='italic', ha='right', va='top',
              bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue"))
     
-    # Keyboard navigation
     def on_key(event):
         if event.key == 'left':
             prev_slide(None)
@@ -489,10 +471,8 @@ def create_interactive_dashboard(images_dict):
     
     fig.canvas.mpl_connect('key_press_event', on_key)
     
-    # Initialize first slide
     update_slide()
     
-    # Enable navigation toolbar
     plt.rcParams['toolbar'] = 'toolbar2'
     
     plt.show()
@@ -500,20 +480,16 @@ def create_interactive_dashboard(images_dict):
     return fig
 
 def create_debug_dashboard(images_dict, window_name="Portafilter Detection Pipeline", save_path=None):
-    # Define the grid layout
     grid_rows = 3
     grid_cols = 4
     cell_width = 400
     cell_height = 300
     
-    # Create the dashboard image
     dashboard = np.zeros((cell_height * grid_rows, cell_width * grid_cols, 3), dtype=np.uint8)
     
-    # Add title
     cv2.putText(dashboard, "Portafilter Detection Pipeline", (10, 30), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     
-    # Place images in grid
     for idx, (step_name, img) in enumerate(images_dict.items()):
         if img is None:
             continue
@@ -524,14 +500,12 @@ def create_debug_dashboard(images_dict, window_name="Portafilter Detection Pipel
         if row >= grid_rows:
             break
             
-        # Resize image to fit cell
         if len(img.shape) == 3:
             h, w = img.shape[:2]
         else:
             h, w = img.shape[:2]
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         
-        # Calculate scaling to fit in cell
         scale = min(cell_width * 0.9 / w, cell_height * 0.8 / h)
         new_w = int(w * scale)
         new_h = int(h * scale)
@@ -539,23 +513,18 @@ def create_debug_dashboard(images_dict, window_name="Portafilter Detection Pipel
         if new_w > 0 and new_h > 0:
             resized_img = cv2.resize(img, (new_w, new_h))
             
-            # Calculate position to center in cell
             y_start = row * cell_height + 50
             x_start = col * cell_width + (cell_width - new_w) // 2
             y_end = y_start + new_h
             x_end = x_start + new_w
             
-            # Place image in dashboard
             dashboard[y_start:y_end, x_start:x_end] = resized_img
             
-            # Add step name
             cv2.putText(dashboard, step_name, (col * cell_width + 10, row * cell_height + 25), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     
-    # Show dashboard
     cv2.imshow(window_name, dashboard)
     
-    # Save dashboard if path provided
     if save_path:
         cv2.imwrite(save_path, dashboard)
         print(f"Dashboard saved to: {save_path}")
@@ -795,11 +764,9 @@ def ellipse_feature_score(image, ellipses, areas, fast_keypoints=None, min_area=
     image_center = np.array([width // 2, height // 2])
     best_ellipse = None
     best_score = float('-inf')
-    # Count loop index is implicit from enumerate.
     print(f"Detected {len(ellipses)} candidate ellipses")
 
     for index, el in enumerate(ellipses):
-        # Basic ellipse info
         (cx, cy), (x_len, y_len), angle = el
         if not (np.isfinite(x_len) and np.isfinite(y_len)):
             continue
@@ -810,14 +777,11 @@ def ellipse_feature_score(image, ellipses, areas, fast_keypoints=None, min_area=
         cv2.ellipse(mask, el, (255, 255, 255), -1)
 
         area = np.count_nonzero(mask)
-        area = areas[index] if index < len(areas) else area  # Use precomputed area
+        area = areas[index] if index < len(areas) else area
         if area < min_area:
             continue
 
-        # Calculate overall feature density score (FAST keypoints only)
         density_score = calculate_feature_density_score(el, image.shape, fast_keypoints)
-        
-        # Use density score as the primary scoring metric
         feature_score = density_score
 
         if fast_keypoints is None:
@@ -826,13 +790,10 @@ def ellipse_feature_score(image, ellipses, areas, fast_keypoints=None, min_area=
         if feature_score < 5:
             continue
 
-        # Penalize off-center ellipses
         dist_from_center = np.linalg.norm(np.array([cx, cy]) - image_center)
         center_penalty = dist_from_center * 0.02
 
-        # Final score: density-based with center bias
         score = feature_score - center_penalty
-        #print(f"Ellipse: {el}, Score: {score:.2f}, Area: {area}, Features: {feature_score:.2f}")
 
         if score > best_score:
             best_score = score
@@ -847,7 +808,6 @@ def crop_image_by_ellipse(image, ellipse, padding=10):
 
     (cx, cy), (major, minor), angle = ellipse
 
-    # Validate ellipse parameters
     if not (np.isfinite(cx) and np.isfinite(cy) and
             np.isfinite(major) and np.isfinite(minor) and
             major > 0 and minor > 0):
@@ -856,7 +816,6 @@ def crop_image_by_ellipse(image, ellipse, padding=10):
 
     height, width = image.shape[:2]
 
-    # Compute ellipse bounding box using cv2.boundingRect on ellipse contour
     mask = np.zeros((height, width), dtype=np.uint8)
     try:
         cv2.ellipse(mask, ellipse, (255, 255, 255), -1)
@@ -864,7 +823,6 @@ def crop_image_by_ellipse(image, ellipse, padding=10):
         print("Failed to draw ellipse:", e)
         return image
 
-    # Find bounding box from mask
     ys, xs = np.where(mask == 255)
     if len(xs) == 0 or len(ys) == 0:
         print("No ellipse pixels found in mask.")
@@ -889,17 +847,14 @@ def calculate_feature_density_score(ellipse, image_shape, fast_keypoints):
     (cx, cy), (major, minor), angle = ellipse
     height, width = image_shape[:2]
     
-    # Create ellipse mask
     mask = np.zeros((height, width), dtype=np.uint8)
     cv2.ellipse(mask, ellipse, (255, 255, 255), -1)
-    
-    # Calculate ellipse area
+
     ellipse_area = np.count_nonzero(mask)
     
     if ellipse_area == 0:
         return 0
     
-    # Count FAST keypoints within ellipse (primary feature)
     feature_count = 0
     if fast_keypoints is not None:
         circle_count = 0
@@ -909,25 +864,16 @@ def calculate_feature_density_score(ellipse, image_shape, fast_keypoints):
                 circle_count += 1
         feature_count += circle_count
     
-    # Calculate density (features per pixel)
     density = (feature_count**2) / (ellipse_area/5)
-
-    #print(f"  Density Analysis:")
-    #print(f"    - Ellipse area: {ellipse_area} pixels")
-    #print(f"    - Total features: {feature_count}")
-    #print(f"    - Feature density: {density:.6f} features/pixel")
     
     return density
 
 def generate_change_mask(frame1, frame2, threshold=30):
-    # Ensure both frames are the same size
     frame1 = cv2.resize(frame1, (frame2.shape[1], frame2.shape[0]))
 
-    # Convert to grayscale or work in LAB space for better colour comparison
     lab1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2LAB)
     lab2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2LAB)
 
-    # Compute absolute difference
     diff = cv2.absdiff(lab1, lab2)
     diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
 
