@@ -1,15 +1,10 @@
 Image Data/
-Video Data/
-Analysis/
 __pycache__/
-*.py[cod]
 .venv/
 venv/
-.env
-.env.*
-.DS_Store
-Thumbs.db
-*.log
-yolo_portafilter/
-dataset.csv
 api_storage/
+Sync_Dataset.py
+Video Data/
+*.mov
+*.mp4
+

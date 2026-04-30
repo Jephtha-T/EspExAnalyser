@@ -1,0 +1,36 @@
+name: cekopi
+description: "Cekopi espresso analysis app."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+  camera: ^0.12.0+1
+  cupertino_icons: ^1.0.8
+  flutter_svg: ^2.0.10+1
+  http: ^1.2.2
+  shared_preferences: ^2.3.2
+  video_player: ^2.9.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_launcher_icons: ^0.14.1
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: assets/Logo.png
+  adaptive_icon_background: '#3C2F2F'
+  adaptive_icon_foreground: assets/Logo.png
+  remove_alpha_ios: true
