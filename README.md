@@ -559,13 +559,6 @@ The desktop app looks for common video types including:
 - Use the backend computer's LAN IP address for a physical phone.
 - Confirm the phone and backend computer are on the same network.
 
-### GitHub Upload Notes
-
-- Commit the `cekopi/` source, assets, runner projects, `pubspec.yaml`, and `pubspec.lock`.
-- Do not commit `cekopi/.dart_tool/` or `cekopi/build/`.
-- Do not commit raw espresso videos in `Video Data/`.
-- Keep large generated runtime folders out of normal Git unless they are intentionally part of a release.
-
 ## Author
 
 Jephtha Ashter Tandri (20600677)
